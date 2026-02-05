@@ -3,6 +3,10 @@ import pandas as pd
 from datetime import datetime
 import time
 import os
+import warnings
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,6 +17,13 @@ def log(msg, elapsed=None):
         print(f"[{ts}] {msg} (took {elapsed:.2f}s)")
     else:
         print(f"[{ts}] {msg}")
+
+
+def log_df_size(name, df):
+    if df is None or not isinstance(df, pd.DataFrame):
+        return
+    rows, cols = df.shape
+    log(f"df size {name}: {rows:,} rows x {cols} cols")
 days = None
 column_mappings = {
     'montra_location_data': {'vin': 'VIN', 'event_at': 'EVENT_AT', 'soc': 'SOC', 'battery_pack_voltage': 'BATTERY_VOLTAGE', 'current': 'BATTERY_CURRENT', 'temperature': 'BATTERY_TEMPERATURE', 'odometer': 'ODOMETER', 'latitude': 'LATITUDE', 'longitude': 'LONGITUDE', 'max_speed': 'VEHICLE_SPEED', 'ignition_status': 'IGNITION_STATUS', 'gps_validity': 'GPS_VALIDITY', 'ride_mode': 'RIDE_MODE', 'rescapacity': 'REMAINING_CAPACITY', 'vehicle_status': 'VEHICLE_STATUS'},
@@ -78,11 +89,25 @@ def fetch_iot_data(conn, table_name, vins, days):
         WHERE vin = ANY(%s)
         AND {ts_col} >= NOW() - INTERVAL '{int(days)} days'
     """
-    df = pd.read_sql(sql, conn, params=(vins,))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        df = pd.read_sql(sql, conn, params=(vins,))
     df["table_name"] = table_name
     df["OEM"] = df["vin"].apply(get_oem_from_vin)
     log(f"fetch_iot_data END table={table_name}", time.time() - t0)
+    log_df_size(f"fetch_iot_data {table_name}", df)
     return df
+
+
+def _fetch_one_table(table_name, vins, days):
+    """Fetch one table using its own connection (for parallel execution)."""
+    conn = connect()
+    if not conn:
+        return pd.DataFrame()
+    try:
+        return fetch_iot_data(conn, table_name, vins, days)
+    finally:
+        conn.close()
 
 
 def pick_and_sanitize(df, cols, rule):
@@ -350,6 +375,12 @@ def ignition_on_count_per_day(subdf):
         return None
     
     return ignition_count / days
+
+def _compute_features_chunk(args):
+    """Worker for ProcessPoolExecutor: (df_std_chunk, days) -> DataFrame."""
+    df_chunk, days = args
+    return compute_features(df_chunk, days)
+
 
 def compute_features(df_std, days):
     final_rows = []
@@ -759,18 +790,18 @@ def main():
     t0 = time.time()
     df_map = map_vins_to_tables(vins)
     table_groups = df_map.groupby("table_name")["VIN"]
-    dfs = table_groups.apply(
-        lambda s: fetch_iot_data(
-            conn=conn,
-            table_name=s.name,
-            vins=s.to_list(),
-            days=days
-        )
-    )
-    log("fetch_iot_data (all tables)", time.time() - t0)
+    tasks = [(table_name, s.to_list()) for table_name, s in table_groups]
+    dfs = []
+    with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as ex:
+        futures = {ex.submit(_fetch_one_table, table_name, vlist, days): table_name for table_name, vlist in tasks}
+        for fut in as_completed(futures):
+            df_part = fut.result()
+            if df_part is not None and not df_part.empty:
+                dfs.append(df_part)
+    log("fetch_iot_data (all tables, parallel)", time.time() - t0)
 
-    if len(dfs) > 0:
-        df_final = dfs.reset_index(drop=True)
+    if dfs:
+        df_final = pd.concat(dfs, ignore_index=True)
     else:
         df_final = pd.DataFrame()
 
@@ -779,18 +810,35 @@ def main():
         conn.close()
         return
 
+    conn.close()
+    log("DB connection closed (fetch done).")
+    log_df_size("df_final (raw IoT)", df_final)
+
     t0 = time.time()
     df_std = standardize(df_final)
     log("standardize", time.time() - t0)
+    log_df_size("df_std (standardized)", df_std)
 
     t0 = time.time()
-    df_features = compute_features(df_std, days)
+    unique_vins = df_std["VIN"].unique()
+    n_workers = min(4, len(unique_vins))
+    if n_workers <= 1:
+        df_features = compute_features(df_std, days)
+    else:
+        vin_splits = np.array_split(unique_vins, n_workers)
+        chunks = [df_std[df_std["VIN"].isin(s)] for s in vin_splits]
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            results = list(ex.map(_compute_features_chunk, [(c, days) for c in chunks]))
+        df_features = pd.concat(results, ignore_index=True)
     log("compute_features", time.time() - t0)
+    log_df_size("df_features", df_features)
+    # df_features.to_csv("df_features.csv", index=False)
 
     t0 = time.time()
     df_long = convert_to_long(df_features)
     df_long['Feature_Value'] = df_long['Feature_Value'].apply(lambda x: round(x, 2) if isinstance(x, (int, float)) else x)
     log("convert_to_long + round", time.time() - t0)
+    log_df_size("df_long", df_long)
 
     t0 = time.time()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -798,8 +846,6 @@ def main():
     df_long.to_csv(output_file, index=False)
     log(f"to_csv -> {output_file}", time.time() - t0)
 
-    conn.close()
-    log("DB connection closed.")
     log("END main")
 
 if __name__ == "__main__":
