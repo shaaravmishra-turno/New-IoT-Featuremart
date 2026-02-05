@@ -71,7 +71,7 @@ def fetch_iot_data(conn, table_name, vins, days):
     """
     df = pd.read_sql(sql, conn, params=(vins,))
     df["table_name"] = table_name
-    df["OEM"] = df["vin"].str.upper().apply(get_oem_from_vin)
+    df["OEM"] = df["vin"].apply(get_oem_from_vin)
     return df
 
 
@@ -101,7 +101,7 @@ SANITIZATION_RULES = {
 
 def map_vins_to_tables(vin_list):
     df = pd.DataFrame({"VIN": vin_list})
-    df["OEM"] = df["VIN"].str.upper().apply(get_oem_from_vin)
+    df["OEM"] = df["VIN"].apply(get_oem_from_vin)
     df["table_name"] = df["VIN"].apply(get_table_for_vin)
     return df
 
@@ -121,9 +121,7 @@ def compute_stats(series, stats_list):
     res = {}
 
     percentiles = {
-        "p1": 0.01, "p5": 0.05, "p10": 0.10,
-        "p50": 0.50,
-        "p90": 0.90, "p95": 0.95, "p99": 0.99
+        "p1": 0.01, "p5": 0.05, "p10": 0.10, "p50": 0.50, "p90": 0.90, "p95": 0.95, "p99": 0.99
     }
 
     if "latest" in stats_list:
@@ -183,28 +181,59 @@ def distance_per_month(subdf):
 def detect_charging_state(subdf):
     df = subdf.copy()
     df["soc_diff"] = df["SOC"].diff()
-    df["is_charging"] = df["soc_diff"] > 0
+    charging = False
+    charging_state = []
+
+    for diff in df["soc_diff"]:
+        if diff > 0:
+            charging = True
+        elif diff < 0:
+            charging = False
+        charging_state.append(charging if diff is not None else False)
+    df["is_charging"] = charging_state
     return df["is_charging"]
 
 def charging_start_soc(subdf):
     df = subdf.copy()
     df["soc_diff"] = df["SOC"].diff()
-    df["charging_start"] = (df["soc_diff"] > 0) & (df["soc_diff"].shift(1) <= 0)
+    is_charging = df["soc_diff"] > 0
+    df["charging_start"] = is_charging & (~is_charging.shift(fill_value=False))
     starts = df.loc[df["charging_start"], "SOC"]
     return starts
 
 def charging_end_soc(subdf):
     df = subdf.copy()
     df["soc_diff"] = df["SOC"].diff()
-    df["charging_end"] = (df["soc_diff"].shift(-1) <= 0) & (df["soc_diff"] > 0)
-    ends = df.loc[df["charging_end"], "SOC"]
-    return ends
+    charging = False
+    end_socs = []
+
+    for idx, diff in enumerate(df["soc_diff"]):
+        if diff > 0 and not charging:
+            charging = True
+        elif diff < 0 and charging:
+            # We consider the previous SOC as the end of charging
+            end_soc = df["SOC"].iloc[idx - 1] if idx > 0 else None
+            if end_soc is not None:
+                end_socs.append(end_soc)
+            charging = False
+
+    return pd.Series(end_socs, name="SOC")
 
 def charging_cycle_count(subdf):
     df = subdf.copy()
     df["soc_diff"] = df["SOC"].diff()
-    df["charging_start"] = (df["soc_diff"] > 0) & (df["soc_diff"].shift(1) <= 0)
-    return df["charging_start"].sum()
+    charging = False
+    count = 0
+
+    for diff in df["soc_diff"]:
+        if diff > 0 and not charging:
+            count += 1
+            charging = True
+        elif diff < 0 and charging:
+            charging = False
+
+
+    return count
 
 def avg_charging_duration(subdf):
     df = subdf.copy()
