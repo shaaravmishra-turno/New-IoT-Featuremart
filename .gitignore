@@ -11,4 +11,5 @@ venv/
 # Python cache
 __pycache__/
 *.pyc
-.csv
+*.csv
+TOKEN.TXT

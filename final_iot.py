@@ -6,6 +6,13 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
+def log(msg, elapsed=None):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    if elapsed is not None:
+        print(f"[{ts}] {msg} (took {elapsed:.2f}s)")
+    else:
+        print(f"[{ts}] {msg}")
 days = None
 column_mappings = {
     'montra_location_data': {'vin': 'VIN', 'event_at': 'EVENT_AT', 'soc': 'SOC', 'battery_pack_voltage': 'BATTERY_VOLTAGE', 'current': 'BATTERY_CURRENT', 'temperature': 'BATTERY_TEMPERATURE', 'odometer': 'ODOMETER', 'latitude': 'LATITUDE', 'longitude': 'LONGITUDE', 'max_speed': 'VEHICLE_SPEED', 'ignition_status': 'IGNITION_STATUS', 'gps_validity': 'GPS_VALIDITY', 'ride_mode': 'RIDE_MODE', 'rescapacity': 'REMAINING_CAPACITY', 'vehicle_status': 'VEHICLE_STATUS'},
@@ -61,6 +68,8 @@ TS_COLUMN_MAP = {
 }
 
 def fetch_iot_data(conn, table_name, vins, days):
+    t0 = time.time()
+    log(f"fetch_iot_data START table={table_name} ({len(vins)} VINs)")
     ts_col = TS_COLUMN_MAP.get(table_name, "timestamp")
 
     sql = f"""
@@ -72,17 +81,26 @@ def fetch_iot_data(conn, table_name, vins, days):
     df = pd.read_sql(sql, conn, params=(vins,))
     df["table_name"] = table_name
     df["OEM"] = df["vin"].apply(get_oem_from_vin)
+    log(f"fetch_iot_data END table={table_name}", time.time() - t0)
     return df
 
 
 def pick_and_sanitize(df, cols, rule):
-    # pick first non-null column
-    col = df.reindex(columns=cols).bfill(axis=1).iloc[:, 0]
+    # Pick first non-null across cols using combine_first (faster than reindex+bfill(axis=1))
+    s = None
+    for c in cols:
+        if c not in df.columns:
+            continue
+        if s is None:
+            s = df[c].copy()
+        else:
+            s = s.combine_first(df[c])
+    if s is None:
+        s = pd.Series(index=df.index, dtype=object)
 
     if rule:
-        col = col.mask((col < rule["min"]) | (col > rule["max"]))
-
-    return col
+        s = s.mask((s < rule["min"]) | (s > rule["max"]))
+    return s
 
 SANITIZATION_RULES = {
     'VEHICLE_SPEED': {'min': 0.0, 'max': 60.0},
@@ -726,15 +744,21 @@ def standardize(df_final):
 
 def main():
     global days
+    log("START main")
     vins = open('vins.txt').read().splitlines()
-    print(f"Total VINs to process: {len(vins)}")
+    log(f"Loaded {len(vins)} VINs from vins.txt")
     days = input("Enter number of days: ")
-    start_time = time.time()
+
+    t0 = time.time()
     conn = connect()
-    print("DB connected!" if conn else "DB failed.")
+    log("DB connect", time.time() - t0)
+    if not conn:
+        log("DB connection failed.")
+        return
+
+    t0 = time.time()
     df_map = map_vins_to_tables(vins)
     table_groups = df_map.groupby("table_name")["VIN"]
-
     dfs = table_groups.apply(
         lambda s: fetch_iot_data(
             conn=conn,
@@ -743,30 +767,40 @@ def main():
             days=days
         )
     )
-    
+    log("fetch_iot_data (all tables)", time.time() - t0)
+
     if len(dfs) > 0:
         df_final = dfs.reset_index(drop=True)
     else:
         df_final = pd.DataFrame()
 
     if df_final.empty:
-        print("No IoT data retrieved.")
+        log("No IoT data retrieved. Exiting.")
         conn.close()
         return
-        
+
+    t0 = time.time()
     df_std = standardize(df_final)
+    log("standardize", time.time() - t0)
+
+    t0 = time.time()
     df_features = compute_features(df_std, days)
+    log("compute_features", time.time() - t0)
+
+    t0 = time.time()
     df_long = convert_to_long(df_features)
     df_long['Feature_Value'] = df_long['Feature_Value'].apply(lambda x: round(x, 2) if isinstance(x, (int, float)) else x)
+    log("convert_to_long + round", time.time() - t0)
+
+    t0 = time.time()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = f"computed_features_{timestamp}.csv"
     df_long.to_csv(output_file, index=False)
-    print(f"Saved: {output_file}")
+    log(f"to_csv -> {output_file}", time.time() - t0)
+
     conn.close()
-    print("DB connection closed.")
-    end_time = time.time()
-    total_seconds = end_time - start_time
-    print(f"Total script execution time: {total_seconds:.2f} seconds")
+    log("DB connection closed.")
+    log("END main")
 
 if __name__ == "__main__":
     main()
