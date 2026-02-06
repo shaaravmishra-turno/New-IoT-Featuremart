@@ -75,6 +75,24 @@ def get_table_for_vin(vin):
         None
     )
 
+
+# Vectorized OEM/table lookup (faster than .apply on large series)
+OEM_FROM_PREFIX3 = {"MD9": "Euler", "MBX": "Piaggio", "P60": "Montra"}
+OEM_FROM_PREFIX2 = {"MA": "Mahindra"}
+
+
+def oem_from_vin_series(vin_series):
+    v = vin_series.astype(str)
+    out = v.str[:3].map(OEM_FROM_PREFIX3)
+    return out.fillna(v.str[:2].map(OEM_FROM_PREFIX2)).fillna("Unknown")
+
+
+def table_from_vin_series(vin_series):
+    v = vin_series.astype(str)
+    out = v.str[:3].map(VIN_TABLE_MAP)
+    return out.fillna(v.str[:2].map(VIN_TABLE_MAP))
+
+
 TS_COLUMN_MAP = {
     'piaggio_vehicle_data': 'gps_data_timestamp',
     'mahindra_vehicle_data': 'last_connected',
@@ -105,7 +123,7 @@ def fetch_iot_data(conn, table_name, vins, days):
         warnings.simplefilter("ignore", UserWarning)
         df = pd.read_sql(sql, conn, params=(vins,))
     df["table_name"] = table_name
-    df["OEM"] = df["vin"].apply(get_oem_from_vin)
+    df["OEM"] = oem_from_vin_series(df["vin"])
     log(f"fetch_iot_data END table={table_name}", time.time() - t0)
     log_df_size(f"fetch_iot_data {table_name}", df)
     return df
@@ -156,8 +174,9 @@ SANITIZATION_RULES = {
 
 def map_vins_to_tables(vin_list):
     df = pd.DataFrame({"VIN": vin_list})
-    df["OEM"] = df["VIN"].apply(get_oem_from_vin)
-    df["table_name"] = df["VIN"].apply(get_table_for_vin)
+    v = df["VIN"].astype(str)
+    df["OEM"] = oem_from_vin_series(v)
+    df["table_name"] = table_from_vin_series(v)
     return df
 
 def get_oem_from_vin(vin):
@@ -859,7 +878,9 @@ def main():
 
     t0 = time.time()
     df_long = convert_to_long(df_features)
-    df_long['Feature_Value'] = df_long['Feature_Value'].apply(lambda x: round(x, 2) if isinstance(x, (int, float)) else x)
+    fv = df_long["Feature_Value"]
+    numeric = pd.to_numeric(fv, errors="coerce")
+    df_long["Feature_Value"] = numeric.round(2).fillna(fv)
     log("convert_to_long + round", time.time() - t0)
     log_df_size("df_long", df_long)
 
