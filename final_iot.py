@@ -327,7 +327,14 @@ def temperature_during_condition(subdf, condition_mask):
     return temps.mean() if len(temps) > 0 else None
 
 def days_vehicle_used(subdf):
-    return subdf["EVENT_AT"].dt.date.nunique()
+    df = subdf.dropna(subset=["ODOMETER", "EVENT_AT"]).copy()
+    if len(df) == 0:
+        return None
+    days_used = 0
+    for _, group in df.groupby(df["EVENT_AT"].dt.date):
+        if group["ODOMETER"].iloc[-1] - group["ODOMETER"].iloc[0] > 1:
+            days_used += 1
+    return days_used
 
 def power_per_km(subdf):
     df = subdf.copy()
