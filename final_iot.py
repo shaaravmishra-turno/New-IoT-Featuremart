@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from dotenv import load_dotenv
 
 load_dotenv()
+warnings.filterwarnings("ignore")
 
 def log(msg, elapsed=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -775,6 +776,7 @@ def standardize(df_final):
 
 def main():
     global days
+    main_start = time.time()
     log("START main")
     vins = open('vins.txt').read().splitlines()
     log(f"Loaded {len(vins)} VINs from vins.txt")
@@ -785,6 +787,7 @@ def main():
     log("DB connect", time.time() - t0)
     if not conn:
         log("DB connection failed.")
+        log("Total time", time.time() - main_start)
         return
 
     t0 = time.time()
@@ -808,6 +811,7 @@ def main():
     if df_final.empty:
         log("No IoT data retrieved. Exiting.")
         conn.close()
+        log("Total time", time.time() - main_start)
         return
 
     conn.close()
@@ -846,6 +850,7 @@ def main():
     df_long.to_csv(output_file, index=False)
     log(f"to_csv -> {output_file}", time.time() - t0)
 
+    log("Total time", time.time() - main_start)
     log("END main")
 
 if __name__ == "__main__":
