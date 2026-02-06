@@ -251,10 +251,19 @@ def detect_charging_state(subdf):
 def charging_start_soc(subdf):
     df = subdf.copy()
     df["soc_diff"] = df["SOC"].diff()
-    is_charging = df["soc_diff"] > 0
-    df["charging_start"] = is_charging & (~is_charging.shift(fill_value=False))
-    starts = df.loc[df["charging_start"], "SOC"]
-    return starts
+    charging = False
+    charging_starts = []
+
+    
+    for idx, diff in enumerate(df["soc_diff"]):
+        if diff > 0 and not charging:
+            soc_start = df["SOC"].iloc[idx]
+            charging_starts.append(soc_start)
+            charging = True
+        elif diff < 0 and charging:
+            charging = False
+
+    return pd.Series(charging_starts, name="SOC")
 
 def charging_end_soc(subdf):
     df = subdf.copy()
