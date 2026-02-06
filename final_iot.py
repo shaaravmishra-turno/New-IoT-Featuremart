@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 load_dotenv()
 warnings.filterwarnings("ignore")
 
+# Parallel workers: fetch (threads), compute_features (processes). Optimal = CPU count.
+N_WORKERS = os.cpu_count() or 4
+
 def log(msg, elapsed=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     if elapsed is not None:
@@ -79,13 +82,21 @@ TS_COLUMN_MAP = {
     'montra_location_data': 'event_at'
 }
 
+
+def _select_columns_for_table(table_name):
+    """Return comma-separated column list for SELECT; only columns we use in standardize."""
+    mapping = column_mappings.get(table_name, {})
+    return ", ".join(mapping.keys()) if mapping else "*"
+
+
 def fetch_iot_data(conn, table_name, vins, days):
     t0 = time.time()
     log(f"fetch_iot_data START table={table_name} ({len(vins)} VINs)")
     ts_col = TS_COLUMN_MAP.get(table_name, "timestamp")
+    cols = _select_columns_for_table(table_name)
 
     sql = f"""
-        SELECT *
+        SELECT {cols}
         FROM {table_name}
         WHERE vin = ANY(%s)
         AND {ts_col} >= NOW() - INTERVAL '{int(days)} days'
@@ -785,6 +796,7 @@ def main():
     global days
     main_start = time.time()
     log("START main")
+    log(f"N_WORKERS={N_WORKERS}")
     vins = open('vins.txt').read().splitlines()
     log(f"Loaded {len(vins)} VINs from vins.txt")
     days = input("Enter number of days: ")
@@ -802,7 +814,7 @@ def main():
     table_groups = df_map.groupby("table_name")["VIN"]
     tasks = [(table_name, s.to_list()) for table_name, s in table_groups]
     dfs = []
-    with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as ex:
+    with ThreadPoolExecutor(max_workers=min(N_WORKERS, len(tasks))) as ex:
         futures = {ex.submit(_fetch_one_table, table_name, vlist, days): table_name for table_name, vlist in tasks}
         for fut in as_completed(futures):
             df_part = fut.result()
@@ -832,7 +844,7 @@ def main():
 
     t0 = time.time()
     unique_vins = df_std["VIN"].unique()
-    n_workers = min(4, len(unique_vins))
+    n_workers = min(N_WORKERS, len(unique_vins))
     if n_workers <= 1:
         df_features = compute_features(df_std, days)
     else:

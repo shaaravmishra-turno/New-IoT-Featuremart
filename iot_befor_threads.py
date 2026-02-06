@@ -15,6 +15,15 @@ def log(msg, elapsed=None):
         print(f"[{ts}] {msg} (took {elapsed:.2f}s)")
     else:
         print(f"[{ts}] {msg}")
+
+
+def log_df_size(name, df):
+    if df is None or not isinstance(df, pd.DataFrame):
+        return
+    rows, cols = df.shape
+    log(f"df size {name}: {rows:,} rows x {cols} cols")
+
+
 days = None
 column_mappings = {
     'montra_location_data': {'vin': 'VIN', 'event_at': 'EVENT_AT', 'soc': 'SOC', 'battery_pack_voltage': 'BATTERY_VOLTAGE', 'current': 'BATTERY_CURRENT', 'temperature': 'BATTERY_TEMPERATURE', 'odometer': 'ODOMETER', 'latitude': 'LATITUDE', 'longitude': 'LONGITUDE', 'max_speed': 'VEHICLE_SPEED', 'ignition_status': 'IGNITION_STATUS', 'gps_validity': 'GPS_VALIDITY', 'ride_mode': 'RIDE_MODE', 'rescapacity': 'REMAINING_CAPACITY', 'vehicle_status': 'VEHICLE_STATUS'},
@@ -84,6 +93,7 @@ def fetch_iot_data(conn, table_name, vins, days):
     df["table_name"] = table_name
     df["OEM"] = df["vin"].apply(get_oem_from_vin)
     log(f"fetch_iot_data END table={table_name}", time.time() - t0)
+    log_df_size(f"fetch_iot_data {table_name}", df)
     return df
 
 
@@ -792,18 +802,23 @@ def main():
         log("Total time", time.time() - main_start)
         return
 
+    log_df_size("df_final (raw IoT)", df_final)
+
     t0 = time.time()
     df_std = standardize(df_final)
     log("standardize", time.time() - t0)
+    log_df_size("df_std (standardized)", df_std)
 
     t0 = time.time()
     df_features = compute_features(df_std, days)
     log("compute_features", time.time() - t0)
+    log_df_size("df_features", df_features)
 
     t0 = time.time()
     df_long = convert_to_long(df_features)
     df_long['Feature_Value'] = df_long['Feature_Value'].apply(lambda x: round(x, 2) if isinstance(x, (int, float)) else x)
     log("convert_to_long + round", time.time() - t0)
+    log_df_size("df_long", df_long)
 
     t0 = time.time()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
