@@ -230,12 +230,25 @@ def duration_above_threshold(subdf, col, threshold):
     df["above"] = df[col] > threshold
     return df.loc[df["above"], "delta_t"].sum()
 
-def drop_per_km(subdf, col):
-    df = subdf.copy()
-    df["delta_val"] = (-df[col].diff()).clip(lower=0)
-    df["delta_km"] = df["ODOMETER"].diff()
-    mask = (df["delta_km"] > 0)
-    return (df.loc[mask, "delta_val"] / df.loc[mask, "delta_km"]).mean()
+def drop_per_km(df, col):
+    if len(df) < 2:
+        return None
+
+    is_charging = detect_charging_state(df)
+    is_discharging = ~is_charging
+    delta_km = df["ODOMETER"].diff()
+    is_running = delta_km > 0
+    mask = is_discharging & is_running
+    if mask.sum() == 0:
+        return None
+
+    delta_val = (-df[col].diff()).clip(lower=0)
+    total_drop = delta_val[mask].sum()
+    total_dist = delta_km[mask].sum()
+    if total_dist == 0:
+        return None
+
+    return total_drop / total_dist
 
 def drop_per_hour(subdf, col, mask):
     df = subdf.copy()
@@ -569,10 +582,10 @@ FEATURES = {
 }
 
 COMPLEX_FEATURES = {
-    "SOC_DROP_PER_KM_RUNNING": lambda df: drop_per_km(df[df["VEHICLE_SPEED"] > 1], "SOC"),
+    "SOC_DROP_PER_KM_RUNNING": lambda df: drop_per_km(df, "SOC"),
     "SOC_DROP_PER_HR_RUNNING": lambda df: drop_per_hour(df, "SOC", df["VEHICLE_SPEED"] > 1),
     "SOC_DROP_PER_HR_IDLE": lambda df: drop_per_hour(df, "SOC", df["VEHICLE_SPEED"] == 0),
-    "BATTERY_REMAINING_CAPACITY_DROP_PER_KM_RUNNING": lambda df: drop_per_km(df[df["VEHICLE_SPEED"] > 1], "REMAINING_CAPACITY"),
+    "BATTERY_REMAINING_CAPACITY_DROP_PER_KM_RUNNING": lambda df: drop_per_km(df, "REMAINING_CAPACITY"),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_RUNNING": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] > 1),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_IDLE": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] == 0),
     "CHARGING_CYCLE_COUNT": lambda df: charging_cycle_count(df),
