@@ -328,9 +328,14 @@ def charging_cycle_count(subdf):
             charging = True
         elif diff < 0 and charging:
             charging = False
-
-
     return count
+
+def avg_charging_cycle_count_per_day(subdf):
+    n_cycles = charging_cycle_count(subdf)
+    days = (subdf["EVENT_AT"].iloc[-1] - subdf["EVENT_AT"].iloc[0]).days
+    if days <= 0:
+        return float(n_cycles) if n_cycles else None
+    return n_cycles / days
 
 def avg_charging_duration(subdf):
     df = subdf.copy()
@@ -590,6 +595,7 @@ COMPLEX_FEATURES = {
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_RUNNING": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] > 1),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_IDLE": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] == 0),
     "CHARGING_CYCLE_COUNT": lambda df: charging_cycle_count(df),
+    "AVG_CHARGING_CYCLE_COUNT_PER_DAY": lambda df: avg_charging_cycle_count_per_day(df),
     "AVG_CHARGING_DURATION": lambda df: avg_charging_duration(df),
     "AVG_CHARGING_DURATION_PER_SOC_INCREASE": lambda df: avg_charging_duration_per_soc(df),
     "SOH_DEGRADATION_PER_DAY": lambda df: soh_degradation_per_day(df),
