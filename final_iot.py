@@ -408,6 +408,33 @@ def ratio_event_per_charge(event_count, charge_cycles):
         return None
     return event_count / charge_cycles
 
+def compute_soc_threshold_features(subdf):
+    soc = subdf["SOC"]
+    n_events = int(soc.notna().sum())
+    n_days = subdf["EVENT_AT"].dt.date.nunique() if "EVENT_AT" in subdf.columns else 0
+    n_charges = charging_cycle_count(subdf)
+
+    thresholds_above = [(95, "95"), (90, "90"), (80, "80")]
+    thresholds_below = [(20, "20"), (10, "10"), (5, "5")]
+
+    result = {}
+
+    for thresh, label in thresholds_above:
+        count = count_threshold_crossings(soc, thresh)
+        result[f"SOC_ABOVE_{label}_COUNT"] = count
+        result[f"SOC_ABOVE_{label}_AVG_PER_EVENT"] = count / n_events if n_events > 0 else None
+        result[f"SOC_ABOVE_{label}_AVG_PER_DAY"] = count / n_days if n_days > 0 else None
+        result[f"SOC_ABOVE_{label}_AVG_PER_CHARGE"] = count / n_charges if n_charges and n_charges > 0 else None
+
+    for thresh, label in thresholds_below:
+        count = count_threshold_crossings_below(soc, thresh)
+        result[f"SOC_BELOW_{label}_COUNT"] = count
+        result[f"SOC_BELOW_{label}_AVG_PER_EVENT"] = count / n_events if n_events > 0 else None
+        result[f"SOC_BELOW_{label}_AVG_PER_DAY"] = count / n_days if n_days > 0 else None
+        result[f"SOC_BELOW_{label}_AVG_PER_CHARGE"] = count / n_charges if n_charges and n_charges > 0 else None
+
+    return result
+
 def ignition_on_count_per_day(subdf):
     df = subdf.copy()
     if "IGNITION_STATUS" not in df.columns:
@@ -463,6 +490,13 @@ def compute_features(df_std, days):
                 row[f"{feat_name}_L{days}"] = func(subdf)
             except Exception as e:
                 row[f"{feat_name}_L{days}"] = None
+
+        try:
+            soc_feats = compute_soc_threshold_features(subdf)
+            for feat_name, val in soc_feats.items():
+                row[f"{feat_name}_L{days}"] = val
+        except Exception:
+            pass
 
         final_rows.append(row)
 
@@ -535,21 +569,9 @@ FEATURES = {
 }
 
 COMPLEX_FEATURES = {
-    "SOC_ABOVE_95_COUNT": lambda df: count_threshold_crossings(df["SOC"], 95),
-    "SOC_ABOVE_90_COUNT": lambda df: count_threshold_crossings(df["SOC"], 90),
-    "SOC_ABOVE_80_COUNT": lambda df: count_threshold_crossings(df["SOC"], 80),
-    "SOC_BELOW_20_COUNT": lambda df: count_threshold_crossings_below(df["SOC"], 20),
-    "SOC_BELOW_10_COUNT": lambda df: count_threshold_crossings_below(df["SOC"], 10),
-    "SOC_BELOW_5_COUNT": lambda df: count_threshold_crossings_below(df["SOC"], 5),
     "SOC_DROP_PER_KM_RUNNING": lambda df: drop_per_km(df[df["VEHICLE_SPEED"] > 1], "SOC"),
     "SOC_DROP_PER_HR_RUNNING": lambda df: drop_per_hour(df, "SOC", df["VEHICLE_SPEED"] > 1),
     "SOC_DROP_PER_HR_IDLE": lambda df: drop_per_hour(df, "SOC", df["VEHICLE_SPEED"] == 0),
-    "RATIO_SOC_ABOVE_95_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings(df["SOC"], 95), charging_cycle_count(df)),
-    "RATIO_SOC_ABOVE_90_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings(df["SOC"], 90), charging_cycle_count(df)),
-    "RATIO_SOC_ABOVE_80_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings(df["SOC"], 80), charging_cycle_count(df)),
-    "RATIO_SOC_BELOW_20_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings_below(df["SOC"], 20), charging_cycle_count(df)),
-    "RATIO_SOC_BELOW_10_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings_below(df["SOC"], 10), charging_cycle_count(df)),
-    "RATIO_SOC_BELOW_5_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings_below(df["SOC"], 5), charging_cycle_count(df)),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_KM_RUNNING": lambda df: drop_per_km(df[df["VEHICLE_SPEED"] > 1], "REMAINING_CAPACITY"),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_RUNNING": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] > 1),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_IDLE": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] == 0),
