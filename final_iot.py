@@ -1,4 +1,5 @@
 import psycopg2
+import psycopg2.errors
 import pandas as pd
 from datetime import datetime
 import time
@@ -14,6 +15,13 @@ warnings.filterwarnings("ignore")
 
 # Parallel workers: fetch (threads), compute_features (processes). Optimal = CPU count.
 N_WORKERS = os.cpu_count() or 4
+
+# Split each table's VINs into this many chunks; each chunk is fetched by a separate thread (multiple threads per table).
+FETCH_THREADS_PER_TABLE = os.cpu_count() or 4
+
+# On SerializationFailure (conflict with recovery): retry this many times, then skip the chunk.
+FETCH_MAX_RETRIES = 3
+FETCH_RETRY_DELAY_SEC = 2
 
 def log(msg, elapsed=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -107,9 +115,9 @@ def _select_columns_for_table(table_name):
     return ", ".join(mapping.keys()) if mapping else "*"
 
 
-def fetch_iot_data(conn, table_name, vins, days):
+def fetch_iot_data(conn, batch_id, table_name, vins, days):
     t0 = time.time()
-    log(f"fetch_iot_data START table={table_name} ({len(vins)} VINs)")
+    log(f"fetch_iot_data batch_id={batch_id} START table={table_name} ({len(vins)} VINs)")
     ts_col = TS_COLUMN_MAP.get(table_name, "timestamp")
     cols = _select_columns_for_table(table_name)
 
@@ -124,20 +132,30 @@ def fetch_iot_data(conn, table_name, vins, days):
         df = pd.read_sql(sql, conn, params=(vins,))
     df["table_name"] = table_name
     df["OEM"] = oem_from_vin_series(df["vin"])
-    log(f"fetch_iot_data END table={table_name}", time.time() - t0)
-    log_df_size(f"fetch_iot_data {table_name}", df)
+    log(f"fetch_iot_data batch_id={batch_id} END table={table_name}", time.time() - t0)
+    log_df_size(f"fetch_iot_data batch_id={batch_id} {table_name}", df)
     return df
 
 
-def _fetch_one_table(table_name, vins, days):
-    """Fetch one table using its own connection (for parallel execution)."""
-    conn = connect()
-    if not conn:
+def _fetch_one_table(batch_id, table_name, vins, days):
+    """Fetch one chunk (table + VIN list). Retry up to FETCH_MAX_RETRIES on SerializationFailure, then skip. batch_id tracks this chunk in logs."""
+    if not vins:
         return pd.DataFrame()
-    try:
-        return fetch_iot_data(conn, table_name, vins, days)
-    finally:
-        conn.close()
+    last_exc = None
+    for attempt in range(FETCH_MAX_RETRIES):
+        conn = connect()
+        if not conn:
+            return pd.DataFrame()
+        try:
+            return fetch_iot_data(conn, batch_id, table_name, vins, days)
+        except psycopg2.errors.SerializationFailure as e:
+            last_exc = e
+            log(f"fetch_iot_data batch_id={batch_id} table={table_name} ({len(vins)} VINs) conflict with recovery (attempt {attempt + 1}/{FETCH_MAX_RETRIES}), retrying in {FETCH_RETRY_DELAY_SEC}s...")
+            time.sleep(FETCH_RETRY_DELAY_SEC)
+        finally:
+            conn.close()
+    log(f"fetch_iot_data batch_id={batch_id} table={table_name} ({len(vins)} VINs) failed after {FETCH_MAX_RETRIES} retries, skipping chunk.")
+    return pd.DataFrame()
 
 
 def pick_and_sanitize(df, cols, rule):
@@ -885,15 +903,25 @@ def main():
     t0 = time.time()
     df_map = map_vins_to_tables(vins)
     table_groups = df_map.groupby("table_name")["VIN"]
-    tasks = [(table_name, s.to_list()) for table_name, s in table_groups]
+    # One task per (batch_id, table, VIN chunk) so multiple threads fetch the same table in parallel. batch_id tracks each chunk in logs.
+    tasks = []
+    batch_id = 0
+    for table_name, vin_series in table_groups:
+        vlist = vin_series.to_list()
+        n_chunks = min(FETCH_THREADS_PER_TABLE, max(1, len(vlist)))
+        for vin_chunk in np.array_split(vlist, n_chunks):
+            if len(vin_chunk) > 0:
+                batch_id += 1
+                tasks.append((batch_id, table_name, list(vin_chunk)))
     dfs = []
-    with ThreadPoolExecutor(max_workers=min(N_WORKERS, len(tasks))) as ex:
-        futures = {ex.submit(_fetch_one_table, table_name, vlist, days): table_name for table_name, vlist in tasks}
+    max_fetch_workers = min(32, max(N_WORKERS, len(tasks)))
+    with ThreadPoolExecutor(max_workers=max_fetch_workers) as ex:
+        futures = {ex.submit(_fetch_one_table, bid, tbl, vlist, days): bid for bid, tbl, vlist in tasks}
         for fut in as_completed(futures):
             df_part = fut.result()
             if df_part is not None and not df_part.empty:
                 dfs.append(df_part)
-    log("fetch_iot_data (all tables, parallel)", time.time() - t0)
+    log("fetch_iot_data (all tables, chunks per table in parallel)", time.time() - t0)
 
     if dfs:
         df_final = pd.concat(dfs, ignore_index=True)
