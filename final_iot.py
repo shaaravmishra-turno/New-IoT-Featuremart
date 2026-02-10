@@ -348,13 +348,6 @@ def charging_cycle_count(subdf):
             charging = False
     return count
 
-def avg_charging_cycle_count_per_day(subdf):
-    n_cycles = charging_cycle_count(subdf)
-    days = (subdf["EVENT_AT"].iloc[-1] - subdf["EVENT_AT"].iloc[0]).days
-    if days <= 0:
-        return float(n_cycles) if n_cycles else None
-    return n_cycles / days
-
 def avg_charging_duration(subdf):
     starts = charging_start_soc(subdf)
     ends = charging_end_soc(subdf)
@@ -395,18 +388,11 @@ def avg_charging_duration_per_soc(subdf):
     return sum(durations) / len(durations)
 
 def soh_degradation_per_day(subdf):
-    df = subdf.copy()
-    soh_values = df["SOH"].dropna()
-    if len(soh_values) < 2:
+    soh_values = subdf["SOH"].dropna()
+    if len(soh_values) < 2 or not days:
         return None
-    
     first_soh = soh_values.iloc[0]
     last_soh = soh_values.iloc[-1]
-    days = (df["EVENT_AT"].iloc[-1] - df["EVENT_AT"].iloc[0]).days
-    
-    if days == 0:
-        return None
-    
     return (first_soh - last_soh) / days
 
 def days_vehicle_used(subdf):
@@ -418,52 +404,6 @@ def days_vehicle_used(subdf):
         if group["ODOMETER"].iloc[-1] - group["ODOMETER"].iloc[0] > 1:
             days_used += 1
     return days_used
-
-def avg_battery_overcurrent_count_per_day(subdf):
-    if len(subdf) == 0:
-        return None
-    count = count_threshold_crossings(subdf["BATTERY_CURRENT"], 150)
-    days = (subdf["EVENT_AT"].iloc[-1] - subdf["EVENT_AT"].iloc[0]).days
-    if days <= 0:
-        return float(count) if count else None
-    return count / days
-
-
-def avg_battery_overtemp_count_per_day(subdf):
-    if len(subdf) == 0:
-        return None
-    count = count_threshold_crossings(subdf["BATTERY_TEMPERATURE"], 60)
-    days = (subdf["EVENT_AT"].iloc[-1] - subdf["EVENT_AT"].iloc[0]).days
-    if days <= 0:
-        return float(count) if count else None
-    return count / days
-
-
-def avg_battery_overtemp_count_per_event(subdf):
-    n_events = len(subdf)
-    if n_events == 0:
-        return None
-    count = count_threshold_crossings(subdf["BATTERY_TEMPERATURE"], 60)
-    return count / n_events
-
-
-def avg_battery_overvoltage_count_per_day(subdf):
-    if len(subdf) == 0:
-        return None
-    count = count_threshold_crossings(subdf["BATTERY_VOLTAGE"], 100)
-    days = (subdf["EVENT_AT"].iloc[-1] - subdf["EVENT_AT"].iloc[0]).days
-    if days <= 0:
-        return float(count) if count else None
-    return count / days
-
-
-def avg_battery_overvoltage_count_per_event(subdf):
-    n_events = len(subdf)
-    if n_events == 0:
-        return None
-    count = count_threshold_crossings(subdf["BATTERY_VOLTAGE"], 100)
-    return count / n_events
-
 
 def power_per_km(subdf):
     df = subdf.copy()
@@ -525,20 +465,13 @@ def compute_soc_threshold_features(subdf):
 
     return result
 
-def ignition_on_count_per_day(subdf):
+def ignition_on_count(subdf):
     df = subdf.copy()
     if "IGNITION_STATUS" not in df.columns:
         return None
-    
     df["ignition_on"] = df["IGNITION_STATUS"] == 1
     df["ignition_start"] = df["ignition_on"] & ~df["ignition_on"].shift(fill_value=False)
-    ignition_count = df["ignition_start"].sum()
-    
-    days = df["EVENT_AT"].dt.date.nunique()
-    if days == 0:
-        return None
-    
-    return ignition_count / days
+    return int(df["ignition_start"].sum())
 
 def _compute_features_chunk(args):
     """Worker for ProcessPoolExecutor: (df_std_chunk, days) -> DataFrame."""
@@ -678,27 +611,28 @@ COMPLEX_FEATURES = {
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_RUNNING": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] > 1),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_IDLE": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] == 0),
     "CHARGING_CYCLE_COUNT": lambda df: charging_cycle_count(df),
-    "AVG_CHARGING_CYCLE_COUNT_PER_DAY": lambda df: avg_charging_cycle_count_per_day(df),
+    "AVG_CHARGING_CYCLE_COUNT_PER_DAY": lambda df: charging_cycle_count(df) / days if days else None,
     "AVG_CHARGING_DURATION": lambda df: avg_charging_duration(df),
     "AVG_CHARGING_DURATION_PER_SOC_INCREASE": lambda df: avg_charging_duration_per_soc(df),
     "SOH_DEGRADATION_PER_DAY": lambda df: soh_degradation_per_day(df),
     "BATTERY_OVERTEMP_COUNT": lambda df: count_threshold_crossings(df["BATTERY_TEMPERATURE"], 60),
-    "AVG_BATTERY_OVERTEMP_COUNT_PER_DAY": lambda df: avg_battery_overtemp_count_per_day(df),
-    "AVG_BATTERY_OVERTEMP_COUNT_PER_EVENT": lambda df: avg_battery_overtemp_count_per_event(df),
+    "AVG_BATTERY_OVERTEMP_COUNT_PER_DAY": lambda df: count_threshold_crossings(df["BATTERY_TEMPERATURE"], 60) / days if days else None,
+    "AVG_BATTERY_OVERTEMP_COUNT_PER_EVENT": lambda df: count_threshold_crossings(df["BATTERY_TEMPERATURE"], 60) / len(df) if len(df) > 0 else None,
     "BATTERY_OVERTEMP_DURATION": lambda df: duration_above_threshold(df, "BATTERY_TEMPERATURE", 60),
     "BATTERY_OVERVOLTAGE_COUNT": lambda df: count_threshold_crossings(df["BATTERY_VOLTAGE"], 100),
-    "BATTERY_OVERVOLTAGE_COUNT_PER_DAY": lambda df: avg_battery_overvoltage_count_per_day(df),
-    "BATTERY_OVERVOLTAGE_COUNT_PER_EVENT": lambda df: avg_battery_overvoltage_count_per_event(df),
+    "BATTERY_OVERVOLTAGE_COUNT_PER_DAY": lambda df: count_threshold_crossings(df["BATTERY_VOLTAGE"], 100) / days if days else None,
+    "BATTERY_OVERVOLTAGE_COUNT_PER_EVENT": lambda df: count_threshold_crossings(df["BATTERY_VOLTAGE"], 100) / len(df) if len(df) > 0 else None,
     "BATTERY_OVERVOLTAGE_DURATION": lambda df: duration_above_threshold(df, "BATTERY_VOLTAGE", 100),
     "BATTERY_OVERCURRENT_COUNT": lambda df: count_threshold_crossings(df["BATTERY_CURRENT"], 150),
-    "AVG_BATTERY_OVERCURRENT_COUNT_PER_DAY": lambda df: avg_battery_overcurrent_count_per_day(df),
+    "AVG_BATTERY_OVERCURRENT_COUNT_PER_DAY": lambda df: count_threshold_crossings(df["BATTERY_CURRENT"], 150) / days if days else None,
     "BATTERY_OVERCURRENT_DURATION": lambda df: duration_above_threshold(df, "BATTERY_CURRENT", 150),
     "SPEED_ABOVE_50_COUNT": lambda df: count_threshold_crossings(df["VEHICLE_SPEED"], 50),
+    "SPEED_ABOVE_50_COUNT_PER_EVENT": lambda df: count_threshold_crossings(df["VEHICLE_SPEED"], 50) / len(df) if len(df) > 0 else None,
     "DISTANCE_TRAVELLED": lambda df: df["ODOMETER"].iloc[-1] - df["ODOMETER"].iloc[0] if len(df) > 0 else None,
     "DISTANCE_PER_MONTH": lambda df: distance_per_month(df),
     "LATEST_ODOMETER": lambda df: df["ODOMETER"].iloc[-1] if len(df) > 0 else None,
     "DAYS_VEHICLE_USED": lambda df: days_vehicle_used(df),
-    "IGNITION_ON_COUNT_PER_DAY": lambda df: ignition_on_count_per_day(df),
+    "IGNITION_ON_COUNT_PER_DAY": lambda df: (ignition_on_count(df) / days) if days and ignition_on_count(df) is not None else None,
     "BATTERY_POWER_KWH_PER_KM": lambda df: power_per_km(df),
     "BATTERY_POWER_KWH_PER_HR": lambda df: power_per_hour(df),
 }
