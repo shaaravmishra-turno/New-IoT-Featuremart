@@ -341,31 +341,41 @@ def avg_charging_duration(subdf):
     starts = charging_start_soc(subdf)
     ends = charging_end_soc(subdf)
     event_times = subdf["EVENT_AT"].reset_index(drop=True)
-    # Only use min(len(starts), len(ends)) to get aligned pairs
     n = min(len(starts), len(ends))
     if n == 0:
         return None
-
-    # Get the EVENT_AT corresponding to those SoC points (reindex is by default positional)
     start_times = event_times.iloc[starts.index[:n]].reset_index(drop=True)
     end_times = event_times.iloc[ends.index[:n]].reset_index(drop=True)
-    # Durations in seconds
     durations = (end_times - start_times).dt.total_seconds()
     durations = durations[durations > 0]
     return durations.mean() if len(durations) > 0 else None
 
 def avg_charging_duration_per_soc(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
-    df["time_diff"] = df["EVENT_AT"].diff().dt.total_seconds()
-    df["is_charging"] = df["soc_diff"] > 0
-    
-    charging_df = df[df["is_charging"] & (df["soc_diff"] > 0)]
-    if len(charging_df) == 0:
+    soc_diff = df["SOC"].diff().reset_index(drop=True)
+    event_times = df["EVENT_AT"].reset_index(drop=True)
+    soc_increased = False
+    last_increase_idx = None
+    durations = []
+
+    for i in range(1, len(soc_diff)):
+        diff = soc_diff[i]
+        if diff > 0:
+            if not soc_increased:
+                soc_increased = True
+                last_increase_idx = i
+            else:
+                duration = (event_times[i] - event_times[last_increase_idx]).total_seconds()
+                durations.append(duration)
+                last_increase_idx = i
+        elif diff < 0:
+            soc_increased = False
+            last_increase_idx = None
+        # if diff == 0: do nothing, continue
+
+    if len(durations) == 0:
         return None
-    
-    time_per_pct = charging_df["time_diff"] / charging_df["soc_diff"]
-    return time_per_pct.mean()
+    return sum(durations) / len(durations)
 
 def soh_degradation_per_day(subdf):
     df = subdf.copy()
