@@ -338,18 +338,21 @@ def avg_charging_cycle_count_per_day(subdf):
     return n_cycles / days
 
 def avg_charging_duration(subdf):
-    df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
-    df["is_charging"] = df["soc_diff"] > 0
-    df["charging_session"] = (~df["is_charging"]).cumsum()
-    
-    durations = []
-    for session, group in df[df["is_charging"]].groupby("charging_session"):
-        if len(group) > 1:
-            duration = (group["EVENT_AT"].iloc[-1] - group["EVENT_AT"].iloc[0]).total_seconds()
-            durations.append(duration)
-    
-    return sum(durations) / len(durations) if len(durations) > 0 else None
+    starts = charging_start_soc(subdf)
+    ends = charging_end_soc(subdf)
+    event_times = subdf["EVENT_AT"].reset_index(drop=True)
+    # Only use min(len(starts), len(ends)) to get aligned pairs
+    n = min(len(starts), len(ends))
+    if n == 0:
+        return None
+
+    # Get the EVENT_AT corresponding to those SoC points (reindex is by default positional)
+    start_times = event_times.iloc[starts.index[:n]].reset_index(drop=True)
+    end_times = event_times.iloc[ends.index[:n]].reset_index(drop=True)
+    # Durations in seconds
+    durations = (end_times - start_times).dt.total_seconds()
+    durations = durations[durations > 0]
+    return durations.mean() if len(durations) > 0 else None
 
 def avg_charging_duration_per_soc(subdf):
     df = subdf.copy()
