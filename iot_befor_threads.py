@@ -1,4 +1,5 @@
 import psycopg2
+from psycopg2.errors import SerializationFailure
 import pandas as pd
 from datetime import datetime
 import time
@@ -78,6 +79,9 @@ TS_COLUMN_MAP = {
     'montra_location_data': 'event_at'
 }
 
+VIN_CHUNK_SIZE = 50
+
+
 def fetch_iot_data(conn, table_name, vins, days):
     t0 = time.time()
     log(f"fetch_iot_data START table={table_name} ({len(vins)} VINs)")
@@ -95,6 +99,33 @@ def fetch_iot_data(conn, table_name, vins, days):
     log(f"fetch_iot_data END table={table_name}", time.time() - t0)
     log_df_size(f"fetch_iot_data {table_name}", df)
     return df
+
+
+def fetch_iot_data_chunked(conn, table_name, vin_list, days):
+    """Fetch IoT data for a table in groups of VIN_CHUNK_SIZE VINs. On SerializationFailure, fall back to VIN-by-VIN and skip failing VINs."""
+    if not vin_list:
+        return pd.DataFrame()
+    all_dfs = []
+    for i in range(0, len(vin_list), VIN_CHUNK_SIZE):
+        chunk = vin_list[i : i + VIN_CHUNK_SIZE]
+        try:
+            df = fetch_iot_data(conn, table_name, chunk, days)
+            if not df.empty:
+                all_dfs.append(df)
+        except SerializationFailure:
+            conn.rollback()  # clear failed transaction so further queries can run
+            log(f"Chunk failed (SerializationFailure), falling back to VIN-by-VIN for table={table_name} ({len(chunk)} VINs)")
+            for vin in chunk:
+                try:
+                    df = fetch_iot_data(conn, table_name, [vin], days)
+                    if not df.empty:
+                        all_dfs.append(df)
+                except SerializationFailure:
+                    conn.rollback()  # clear failed transaction before next VIN
+                    log(f"Skipping VIN due to SerializationFailure: {vin}")
+    if not all_dfs:
+        return pd.DataFrame()
+    return pd.concat(all_dfs, ignore_index=True)
 
 
 def pick_and_sanitize(df, cols, rule):
@@ -250,8 +281,7 @@ def distance_per_month(subdf):
 
 def detect_charging_state(subdf):
     df = subdf.copy()
-    soc = pd.to_numeric(df["SOC"], errors="coerce")
-    df["soc_diff"] = soc.diff()
+    df["soc_diff"] = pd.to_numeric(df["SOC"], errors="coerce").diff()
     charging = False
     charging_state = []
 
@@ -284,7 +314,7 @@ def charging_start_soc(subdf):
 
 def charging_end_soc(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
+    df["soc_diff"] = pd.to_numeric(df["SOC"], errors="coerce").diff()
     charging = False
     end_socs = []
 
@@ -302,8 +332,7 @@ def charging_end_soc(subdf):
 
 def charging_cycle_count(subdf):
     df = subdf.copy()
-    soc = pd.to_numeric(df["SOC"], errors="coerce")
-    df["soc_diff"] = soc.diff()
+    df["soc_diff"] = pd.to_numeric(df["SOC"], errors="coerce").diff()
     charging = False
     count = 0
 
@@ -881,10 +910,10 @@ def main():
     df_map = map_vins_to_tables(vins)
     table_groups = df_map.groupby("table_name")["VIN"]
     dfs = table_groups.apply(
-        lambda s: fetch_iot_data(
+        lambda s: fetch_iot_data_chunked(
             conn=conn,
             table_name=s.name,
-            vins=s.to_list(),
+            vin_list=s.to_list(),
             days=days
         )
     )
