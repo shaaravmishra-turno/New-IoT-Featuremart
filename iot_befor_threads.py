@@ -186,19 +186,59 @@ def duration_above_threshold(subdf, col, threshold):
     df["above"] = df[col] > threshold
     return df.loc[df["above"], "delta_t"].sum()
 
-def drop_per_km(subdf, col):
-    df = subdf.copy()
-    df["delta_val"] = (-df[col].diff()).clip(lower=0)
-    df["delta_km"] = df["ODOMETER"].diff()
-    mask = (df["delta_km"] > 0)
-    return (df.loc[mask, "delta_val"] / df.loc[mask, "delta_km"]).mean()
+def drop_per_km(df, col, discharging_mask=None):
+    if len(df) < 2:
+        return None
+
+    if discharging_mask is None:
+        discharging_mask = pd.Series(True, index=df.index)
+
+    delta_km = df["ODOMETER"].diff()
+    is_running = delta_km > 0
+    mask = discharging_mask & is_running
+    if mask.sum() == 0:
+        return None
+
+    delta_val = (-df[col].diff()).clip(lower=0)
+    total_drop = delta_val[mask].sum()
+    total_dist = delta_km[mask].sum()
+    if total_dist == 0:
+        return None
+
+    return total_drop / total_dist
 
 def drop_per_hour(subdf, col, mask):
     df = subdf.copy()
-    df["delta_val"] = (-df[col].diff()).clip(lower=0)     #clip neg values to 0
+    drops = []
+    df["diff"] = df[col].diff()
     df["delta_t"] = df["EVENT_AT"].diff().dt.total_seconds() / 3600
-    valid = mask & (df["delta_t"] > 0)
-    return (df.loc[valid, "delta_val"] / df.loc[valid, "delta_t"]).mean()
+
+    is_dropping = False
+    t1 = v1 = None
+
+    for i in range(1, len(df)):
+        if not mask.iloc[i]:
+            is_dropping = False
+            t1 = v1 = None
+            continue
+        d = df["diff"].iloc[i]
+        if d < 0:
+            if not is_dropping:
+                is_dropping = True
+                t1 = df["EVENT_AT"].iloc[i-1]
+                v1 = df[col].iloc[i-1]
+        elif d > 0 and is_dropping:
+            t2 = df["EVENT_AT"].iloc[i-1]
+            v2 = df[col].iloc[i-1]
+            dt = (t2-t1).total_seconds()/3600 if t1 and t2 else 0
+            dv = v1 - v2 if v1 and v2 else 0
+            if dt > 1/60 and dv > 0:
+                drops.append(dv/dt)
+            is_dropping = False
+            t1 = v1 = None
+    if drops:
+        return sum(drops)/len(drops)
+    return None
 
 def distance_per_month(subdf):
     df = subdf
@@ -210,7 +250,8 @@ def distance_per_month(subdf):
 
 def detect_charging_state(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    df["soc_diff"] = soc.diff()
     charging = False
     charging_state = []
 
@@ -225,11 +266,21 @@ def detect_charging_state(subdf):
 
 def charging_start_soc(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
-    is_charging = df["soc_diff"] > 0
-    df["charging_start"] = is_charging & (~is_charging.shift(fill_value=False))
-    starts = df.loc[df["charging_start"], "SOC"]
-    return starts
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    df["soc_diff"] = soc.diff()
+    charging = False
+    charging_starts = []
+
+    
+    for idx, diff in enumerate(df["soc_diff"]):
+        if diff > 0 and not charging:
+            soc_start = df["SOC"].iloc[idx]
+            charging_starts.append(soc_start)
+            charging = True
+        elif diff < 0 and charging:
+            charging = False
+
+    return pd.Series(charging_starts, name="SOC")
 
 def charging_end_soc(subdf):
     df = subdf.copy()
@@ -251,7 +302,8 @@ def charging_end_soc(subdf):
 
 def charging_cycle_count(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    df["soc_diff"] = soc.diff()
     charging = False
     count = 0
 
@@ -261,56 +313,55 @@ def charging_cycle_count(subdf):
             charging = True
         elif diff < 0 and charging:
             charging = False
-
-
     return count
 
 def avg_charging_duration(subdf):
-    df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
-    df["is_charging"] = df["soc_diff"] > 0
-    df["charging_session"] = (~df["is_charging"]).cumsum()
-    
-    durations = []
-    for session, group in df[df["is_charging"]].groupby("charging_session"):
-        if len(group) > 1:
-            duration = (group["EVENT_AT"].iloc[-1] - group["EVENT_AT"].iloc[0]).total_seconds()
-            durations.append(duration)
-    
-    return sum(durations) / len(durations) if len(durations) > 0 else None
+    starts = charging_start_soc(subdf)
+    ends = charging_end_soc(subdf)
+    event_times = subdf["EVENT_AT"].reset_index(drop=True)
+    n = min(len(starts), len(ends))
+    if n == 0:
+        return None
+    start_times = event_times.iloc[starts.index[:n]].reset_index(drop=True)
+    end_times = event_times.iloc[ends.index[:n]].reset_index(drop=True)
+    durations = (end_times - start_times).dt.total_seconds()
+    durations = durations[durations > 0]
+    return durations.mean() if len(durations) > 0 else None
 
 def avg_charging_duration_per_soc(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
-    df["time_diff"] = df["EVENT_AT"].diff().dt.total_seconds()
-    df["is_charging"] = df["soc_diff"] > 0
-    
-    charging_df = df[df["is_charging"] & (df["soc_diff"] > 0)]
-    if len(charging_df) == 0:
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    soc_diff = soc.diff().reset_index(drop=True)
+    event_times = df["EVENT_AT"].reset_index(drop=True)
+    soc_increased = False
+    last_increase_idx = None
+    durations = []
+
+    for i in range(1, len(soc_diff)):
+        diff = soc_diff[i]
+        if diff > 0:
+            if not soc_increased:
+                soc_increased = True
+                last_increase_idx = i
+            else:
+                duration = (event_times[i] - event_times[last_increase_idx]).total_seconds()
+                durations.append(duration)
+                last_increase_idx = i
+        elif diff < 0:
+            soc_increased = False
+            last_increase_idx = None
+
+    if len(durations) == 0:
         return None
-    
-    time_per_pct = charging_df["time_diff"] / charging_df["soc_diff"]
-    return time_per_pct.mean()
+    return sum(durations) / len(durations)
 
 def soh_degradation_per_day(subdf):
-    df = subdf.copy()
-    soh_values = df["SOH"].dropna()
-    if len(soh_values) < 2:
+    soh_values = subdf["SOH"].dropna()
+    if len(soh_values) < 2 or not days:
         return None
-    
     first_soh = soh_values.iloc[0]
     last_soh = soh_values.iloc[-1]
-    days = (df["EVENT_AT"].iloc[-1] - df["EVENT_AT"].iloc[0]).days
-    
-    if days == 0:
-        return None
-    
     return (first_soh - last_soh) / days
-
-def temperature_during_condition(subdf, condition_mask):
-    df = subdf.copy()
-    temps = df.loc[condition_mask, "BATTERY_TEMPERATURE"].dropna()
-    return temps.mean() if len(temps) > 0 else None
 
 def days_vehicle_used(subdf):
 
@@ -351,25 +402,70 @@ def power_per_hour(subdf):
     
     return (df.loc[mask, "delta_power"] / df.loc[mask, "delta_t"]).mean()
 
-def ratio_event_per_charge(event_count, charge_cycles):
-    if charge_cycles in (None, 0):
-        return None
-    return event_count / charge_cycles
-
-def ignition_on_count_per_day(subdf):
+def ignition_on_count(subdf):
     df = subdf.copy()
     if "IGNITION_STATUS" not in df.columns:
         return None
-    
     df["ignition_on"] = df["IGNITION_STATUS"] == 1
     df["ignition_start"] = df["ignition_on"] & ~df["ignition_on"].shift(fill_value=False)
-    ignition_count = df["ignition_start"].sum()
-    
-    days = df["EVENT_AT"].dt.date.nunique()
-    if days == 0:
-        return None
-    
-    return ignition_count / days
+    return int(df["ignition_start"].sum())
+
+def compute_soc_threshold_features(subdf):
+    soc = subdf["SOC"]
+    n_events = int(soc.notna().sum())
+    n_days = subdf["EVENT_AT"].dt.date.nunique() if "EVENT_AT" in subdf.columns else 0
+    n_charges = charging_cycle_count(subdf)
+
+    thresholds_above = [(95, "95"), (90, "90"), (80, "80")]
+    thresholds_below = [(20, "20"), (10, "10"), (5, "5")]
+
+    result = {}
+
+    for thresh, label in thresholds_above:
+        count = count_threshold_crossings(soc, thresh)
+        result[f"SOC_ABOVE_{label}_COUNT"] = count
+        result[f"SOC_ABOVE_{label}_AVG_PER_EVENT"] = count / n_events if n_events > 0 else None
+        result[f"SOC_ABOVE_{label}_AVG_PER_DAY"] = count / n_days if n_days > 0 else None
+        result[f"SOC_ABOVE_{label}_AVG_PER_CHARGE"] = count / n_charges if n_charges and n_charges > 0 else None
+
+    for thresh, label in thresholds_below:
+        count = count_threshold_crossings_below(soc, thresh)
+        result[f"SOC_BELOW_{label}_COUNT"] = count
+        result[f"SOC_BELOW_{label}_AVG_PER_EVENT"] = count / n_events if n_events > 0 else None
+        result[f"SOC_BELOW_{label}_AVG_PER_DAY"] = count / n_days if n_days > 0 else None
+        result[f"SOC_BELOW_{label}_AVG_PER_CHARGE"] = count / n_charges if n_charges and n_charges > 0 else None
+
+    return result
+
+def compute_cached_features(subdf, days):
+    n_events = len(subdf)
+    result = {}
+    overtemp_count = count_threshold_crossings(subdf["BATTERY_TEMPERATURE"], 60)
+    overvoltage_count = count_threshold_crossings(subdf["BATTERY_VOLTAGE"], 100)
+    overcurrent_count = count_threshold_crossings(subdf["BATTERY_CURRENT"], 150)
+    speed_50_count = count_threshold_crossings(subdf["VEHICLE_SPEED"], 50)
+    discharging_mask = ~detect_charging_state(subdf)
+    cc_count = charging_cycle_count(subdf)
+    dvu = days_vehicle_used(subdf)
+    ign_count = ignition_on_count(subdf)
+    result["BATTERY_OVERTEMP_COUNT"] = overtemp_count
+    result["AVG_BATTERY_OVERTEMP_COUNT_PER_DAY"] = overtemp_count / days if days else None
+    result["AVG_BATTERY_OVERTEMP_COUNT_PER_EVENT"] = overtemp_count / n_events if n_events > 0 else None
+    result["BATTERY_OVERVOLTAGE_COUNT"] = overvoltage_count
+    result["BATTERY_OVERVOLTAGE_COUNT_PER_DAY"] = overvoltage_count / days if days else None
+    result["BATTERY_OVERVOLTAGE_COUNT_PER_EVENT"] = overvoltage_count / n_events if n_events > 0 else None
+    result["BATTERY_OVERCURRENT_COUNT"] = overcurrent_count
+    result["AVG_BATTERY_OVERCURRENT_COUNT_PER_DAY"] = overcurrent_count / days if days else None
+    result["SPEED_ABOVE_50_COUNT"] = speed_50_count
+    result["SPEED_ABOVE_50_COUNT_PER_EVENT"] = speed_50_count / n_events if n_events > 0 else None
+    result["SOC_DROP_PER_KM_RUNNING"] = drop_per_km(subdf, "SOC", discharging_mask)
+    result["BATTERY_REMAINING_CAPACITY_DROP_PER_KM_RUNNING"] = drop_per_km(subdf, "REMAINING_CAPACITY", discharging_mask)
+    result["CHARGING_CYCLE_COUNT"] = cc_count
+    result["AVG_CHARGING_CYCLE_COUNT_PER_DAY"] = cc_count / days if days else None
+    result["DAYS_VEHICLE_USED"] = dvu
+    result["DAYS_VEHICLE_USED_PER_DAY"] = dvu / days if days and dvu is not None else None
+    result["IGNITION_ON_COUNT_PER_DAY"] = (ign_count / days) if days and ign_count is not None else None
+    return result
 
 def compute_features(df_std, days):
     final_rows = []
@@ -388,6 +484,10 @@ def compute_features(df_std, days):
         )
         subdf["CHARGING_START_SOC"] = charging_start_soc(subdf)
         subdf["CHARGING_END_SOC"] = charging_end_soc(subdf)
+        charging_mask = detect_charging_state(subdf)
+        running_mask = subdf["VEHICLE_SPEED"] > 1
+        subdf["BATTERY_TEMP_DURING_CHARGE"] = subdf.loc[charging_mask, "BATTERY_TEMPERATURE"]
+        subdf["BATTERY_TEMP_DURING_RUNNING"] = subdf.loc[running_mask, "BATTERY_TEMPERATURE"]
 
         row = {
             "VIN": vin,
@@ -405,6 +505,20 @@ def compute_features(df_std, days):
                 row[f"{feat_name}_L{days}"] = func(subdf)
             except Exception as e:
                 row[f"{feat_name}_L{days}"] = None
+
+        try:
+            soc_feats = compute_soc_threshold_features(subdf)
+            for feat_name, val in soc_feats.items():
+                row[f"{feat_name}_L{days}"] = val
+        except Exception:
+            pass
+
+        try:
+            cached_feats = compute_cached_features(subdf, days)
+            for feat_name, val in cached_feats.items():
+                row[f"{feat_name}_L{days}"] = val
+        except Exception:
+            pass
 
         final_rows.append(row)
 
@@ -470,6 +584,14 @@ FEATURES = {
         "col": "MOTOR_TEMPERATURE",
         "stats": ["avg", "min", "max", "p1", "p5", "p10", "p50", "p90", "p95", "p99", "var"]
     },
+    "BATTERY_TEMPERATURE_DURING_CHARGE": {
+        "col": "BATTERY_TEMP_DURING_CHARGE",
+        "stats": ["avg", "min", "max", "p1", "p5", "p10", "p50", "p90", "p95", "p99", "var"]
+    },
+    "BATTERY_TEMPERATURE_DURING_RUNNING": {
+        "col": "BATTERY_TEMP_DURING_RUNNING",
+        "stats": ["avg", "min", "max", "p1", "p5", "p10", "p50", "p90", "p95", "p99", "var"]
+    },
     "POWER_DRAWN_KWH": {
         "col": "POWER_DRAWN_KWH",
         "stats": ["latest", "avg", "min", "max", "p1", "p5", "p10", "p50", "p90", "p95", "p99", "var"]
@@ -477,42 +599,19 @@ FEATURES = {
 }
 
 COMPLEX_FEATURES = {
-    "SOC_ABOVE_95_COUNT": lambda df: count_threshold_crossings(df["SOC"], 95),
-    "SOC_ABOVE_90_COUNT": lambda df: count_threshold_crossings(df["SOC"], 90),
-    "SOC_ABOVE_80_COUNT": lambda df: count_threshold_crossings(df["SOC"], 80),
-    "SOC_BELOW_20_COUNT": lambda df: count_threshold_crossings_below(df["SOC"], 20),
-    "SOC_BELOW_10_COUNT": lambda df: count_threshold_crossings_below(df["SOC"], 10),
-    "SOC_BELOW_5_COUNT": lambda df: count_threshold_crossings_below(df["SOC"], 5),
-    "SOC_DROP_PER_KM_RUNNING": lambda df: drop_per_km(df[df["VEHICLE_SPEED"] > 1], "SOC"),
     "SOC_DROP_PER_HR_RUNNING": lambda df: drop_per_hour(df, "SOC", df["VEHICLE_SPEED"] > 1),
     "SOC_DROP_PER_HR_IDLE": lambda df: drop_per_hour(df, "SOC", df["VEHICLE_SPEED"] == 0),
-    "RATIO_SOC_ABOVE_95_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings(df["SOC"], 95), charging_cycle_count(df)),
-    "RATIO_SOC_ABOVE_90_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings(df["SOC"], 90), charging_cycle_count(df)),
-    "RATIO_SOC_ABOVE_80_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings(df["SOC"], 80), charging_cycle_count(df)),
-    "RATIO_SOC_BELOW_20_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings_below(df["SOC"], 20), charging_cycle_count(df)),
-    "RATIO_SOC_BELOW_10_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings_below(df["SOC"], 10), charging_cycle_count(df)),
-    "RATIO_SOC_BELOW_5_PER_CHARGE": lambda df: ratio_event_per_charge(count_threshold_crossings_below(df["SOC"], 5), charging_cycle_count(df)),
-    "BATTERY_REMAINING_CAPACITY_DROP_PER_KM_RUNNING": lambda df: drop_per_km(df[df["VEHICLE_SPEED"] > 1], "REMAINING_CAPACITY"),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_RUNNING": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] > 1),
     "BATTERY_REMAINING_CAPACITY_DROP_PER_HR_IDLE": lambda df: drop_per_hour(df, "REMAINING_CAPACITY", df["VEHICLE_SPEED"] == 0),
-    "CHARGING_CYCLE_COUNT": lambda df: charging_cycle_count(df),
     "AVG_CHARGING_DURATION": lambda df: avg_charging_duration(df),
     "AVG_CHARGING_DURATION_PER_SOC_INCREASE": lambda df: avg_charging_duration_per_soc(df),
     "SOH_DEGRADATION_PER_DAY": lambda df: soh_degradation_per_day(df),
-    "BATTERY_OVERTEMP_COUNT": lambda df: count_threshold_crossings(df["BATTERY_TEMPERATURE"], 60),
     "BATTERY_OVERTEMP_DURATION": lambda df: duration_above_threshold(df, "BATTERY_TEMPERATURE", 60),
-    "BATTERY_TEMPERATURE_DURING_CHARGE": lambda df: temperature_during_condition(df, detect_charging_state(df)),
-    "BATTERY_TEMPERATURE_DURING_RUNNING": lambda df: temperature_during_condition(df, df["VEHICLE_SPEED"] > 1),
-    "BATTERY_OVERVOLTAGE_COUNT": lambda df: count_threshold_crossings(df["BATTERY_VOLTAGE"], 100),
     "BATTERY_OVERVOLTAGE_DURATION": lambda df: duration_above_threshold(df, "BATTERY_VOLTAGE", 100),
-    "BATTERY_OVERCURRENT_COUNT": lambda df: count_threshold_crossings(df["BATTERY_CURRENT"], 150),
     "BATTERY_OVERCURRENT_DURATION": lambda df: duration_above_threshold(df, "BATTERY_CURRENT", 150),
-    "SPEED_ABOVE_50_COUNT": lambda df: count_threshold_crossings(df["VEHICLE_SPEED"], 50),
     "DISTANCE_TRAVELLED": lambda df: df["ODOMETER"].iloc[-1] - df["ODOMETER"].iloc[0] if len(df) > 0 else None,
     "DISTANCE_PER_MONTH": lambda df: distance_per_month(df),
     "LATEST_ODOMETER": lambda df: df["ODOMETER"].iloc[-1] if len(df) > 0 else None,
-    "DAYS_VEHICLE_USED": lambda df: days_vehicle_used(df),
-    "IGNITION_ON_COUNT_PER_DAY": lambda df: ignition_on_count_per_day(df),
     "BATTERY_POWER_KWH_PER_KM": lambda df: power_per_km(df),
     "BATTERY_POWER_KWH_PER_HR": lambda df: power_per_hour(df),
 }
