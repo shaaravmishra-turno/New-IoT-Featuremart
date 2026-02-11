@@ -19,10 +19,6 @@ N_WORKERS = os.cpu_count() or 4
 # Split each table's VINs into this many chunks; each chunk is fetched by a separate thread (multiple threads per table).
 FETCH_THREADS_PER_TABLE = os.cpu_count() or 4
 
-# On SerializationFailure (conflict with recovery): retry this many times, then skip the chunk.
-FETCH_MAX_RETRIES = 3
-FETCH_RETRY_DELAY_SEC = 2
-
 def log(msg, elapsed=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     if elapsed is not None:
@@ -137,25 +133,30 @@ def fetch_iot_data(conn, batch_id, table_name, vins, days):
     return df
 
 
+def _is_serialization_failure(e):
+    """Check if exception is SerializationFailure (direct or wrapped by pandas)."""
+    if isinstance(e, psycopg2.errors.SerializationFailure):
+        return True
+    cause = getattr(e, "__cause__", None)
+    return cause is not None and isinstance(cause, psycopg2.errors.SerializationFailure)
+
+
 def _fetch_one_table(batch_id, table_name, vins, days):
-    """Fetch one chunk (table + VIN list). Retry up to FETCH_MAX_RETRIES on SerializationFailure, then skip. batch_id tracks this chunk in logs."""
+    """Fetch one chunk (table + VIN list). Skip chunk on SerializationFailure (conflict with recovery)."""
     if not vins:
         return pd.DataFrame()
-    last_exc = None
-    for attempt in range(FETCH_MAX_RETRIES):
-        conn = connect()
-        if not conn:
-            return pd.DataFrame()
-        try:
-            return fetch_iot_data(conn, batch_id, table_name, vins, days)
-        except psycopg2.errors.SerializationFailure as e:
-            last_exc = e
-            log(f"fetch_iot_data batch_id={batch_id} table={table_name} ({len(vins)} VINs) conflict with recovery (attempt {attempt + 1}/{FETCH_MAX_RETRIES}), retrying in {FETCH_RETRY_DELAY_SEC}s...")
-            time.sleep(FETCH_RETRY_DELAY_SEC)
-        finally:
-            conn.close()
-    log(f"fetch_iot_data batch_id={batch_id} table={table_name} ({len(vins)} VINs) failed after {FETCH_MAX_RETRIES} retries, skipping chunk.")
-    return pd.DataFrame()
+    conn = connect()
+    if not conn:
+        return pd.DataFrame()
+    try:
+        return fetch_iot_data(conn, batch_id, table_name, vins, days)
+    except (psycopg2.errors.SerializationFailure, pd.errors.DatabaseError) as e:
+        if not _is_serialization_failure(e):
+            raise
+        log(f"fetch_iot_data batch_id={batch_id} table={table_name} ({len(vins)} VINs) conflict with recovery, skipping chunk.")
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
 
 def pick_and_sanitize(df, cols, rule):
@@ -312,7 +313,8 @@ def distance_per_month(subdf):
 
 def detect_charging_state(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    df["soc_diff"] = soc.diff()
     charging = False
     charging_state = []
 
@@ -327,7 +329,8 @@ def detect_charging_state(subdf):
 
 def charging_start_soc(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    df["soc_diff"] = soc.diff()
     charging = False
     charging_starts = []
 
@@ -344,7 +347,8 @@ def charging_start_soc(subdf):
 
 def charging_end_soc(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    df["soc_diff"] = soc.diff()
     charging = False
     end_socs = []
 
@@ -362,7 +366,8 @@ def charging_end_soc(subdf):
 
 def charging_cycle_count(subdf):
     df = subdf.copy()
-    df["soc_diff"] = df["SOC"].diff()
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    df["soc_diff"] = soc.diff()
     charging = False
     count = 0
 
@@ -389,7 +394,8 @@ def avg_charging_duration(subdf):
 
 def avg_charging_duration_per_soc(subdf):
     df = subdf.copy()
-    soc_diff = df["SOC"].diff().reset_index(drop=True)
+    soc = pd.to_numeric(df["SOC"], errors="coerce")
+    soc_diff = soc.diff().reset_index(drop=True)
     event_times = df["EVENT_AT"].reset_index(drop=True)
     soc_increased = False
     last_increase_idx = None
