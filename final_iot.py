@@ -997,7 +997,6 @@ def main():
         df_features = pd.concat(results, ignore_index=True)
     log("compute_features", time.time() - t0)
     log_df_size("df_features", df_features)
-    # df_features.to_csv("df_features.csv", index=False)
 
     t0 = time.time()
     df_long = convert_to_long(df_features)
