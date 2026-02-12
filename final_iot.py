@@ -24,6 +24,9 @@ N_WORKERS = os.cpu_count() or 4
 # Total max threads used for fetching (shared across all tables). Pool and executor use this limit.
 MAX_FETCH_THREADS = min(32, os.cpu_count() or 4)
 
+# Max VINs per fetch chunk (smaller chunks reduce load and conflict-with-recovery errors).
+MAX_VINS_PER_CHUNK = 50
+
 def log(msg, elapsed=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     if elapsed is not None:
@@ -1016,12 +1019,12 @@ def main():
     t0 = time.time()
     df_map = map_vins_to_tables(vins)
     table_groups = df_map.groupby("table_name")["VIN"]
-    # Build one task per (table, VIN chunk). Total concurrency for fetch is capped by MAX_FETCH_THREADS.
+    # Build one task per (table, VIN chunk). Chunk size capped at MAX_VINS_PER_CHUNK; concurrency capped by MAX_FETCH_THREADS.
     tasks = []
     batch_id = 0
     for table_name, vin_series in table_groups:
         vlist = vin_series.to_list()
-        n_chunks = min(MAX_FETCH_THREADS, max(1, len(vlist)))
+        n_chunks = max(1, (len(vlist) + MAX_VINS_PER_CHUNK - 1) // MAX_VINS_PER_CHUNK)
         for vin_chunk in np.array_split(vlist, n_chunks):
             if len(vin_chunk) > 0:
                 batch_id += 1
