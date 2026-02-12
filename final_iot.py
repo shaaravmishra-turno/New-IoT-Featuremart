@@ -1,5 +1,6 @@
 import psycopg2
 import psycopg2.errors
+from psycopg2.pool import ThreadedConnectionPool
 import pandas as pd
 from datetime import datetime
 import time
@@ -16,8 +17,8 @@ warnings.filterwarnings("ignore")
 # Parallel workers: fetch (threads), compute_features (processes). Optimal = CPU count.
 N_WORKERS = os.cpu_count() or 4
 
-# Split each table's VINs into this many chunks; each chunk is fetched by a separate thread (multiple threads per table).
-FETCH_THREADS_PER_TABLE = os.cpu_count() or 4
+# Total max threads used for fetching (shared across all tables). Pool and executor use this limit.
+MAX_FETCH_THREADS = min(32, os.cpu_count() or 4)
 
 def log(msg, elapsed=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -111,9 +112,10 @@ def _select_columns_for_table(table_name):
     return ", ".join(mapping.keys()) if mapping else "*"
 
 
-def fetch_iot_data(conn, batch_id, table_name, vins, days):
-    t0 = time.time()
-    log(f"fetch_iot_data batch_id={batch_id} START table={table_name} ({len(vins)} VINs)")
+def fetch_iot_data(conn, batch_id, table_name, vins, days, quiet=False):
+    if not quiet:
+        t0 = time.time()
+        log(f"fetch_iot_data batch_id={batch_id} START table={table_name} ({len(vins)} VINs)")
     ts_col = TS_COLUMN_MAP.get(table_name, "timestamp")
     cols = _select_columns_for_table(table_name)
 
@@ -128,8 +130,9 @@ def fetch_iot_data(conn, batch_id, table_name, vins, days):
         df = pd.read_sql(sql, conn, params=(vins,))
     df["table_name"] = table_name
     df["OEM"] = oem_from_vin_series(df["vin"])
-    log(f"fetch_iot_data batch_id={batch_id} END table={table_name}", time.time() - t0)
-    log_df_size(f"fetch_iot_data batch_id={batch_id} {table_name}", df)
+    if not quiet:
+        log(f"fetch_iot_data batch_id={batch_id} END table={table_name}", time.time() - t0)
+        log_df_size(f"fetch_iot_data batch_id={batch_id} {table_name}", df)
     return df
 
 
@@ -141,22 +144,61 @@ def _is_serialization_failure(e):
     return cause is not None and isinstance(cause, psycopg2.errors.SerializationFailure)
 
 
-def _fetch_one_table(batch_id, table_name, vins, days):
-    """Fetch one chunk (table + VIN list). Skip chunk on SerializationFailure (conflict with recovery)."""
+def _fetch_one_table(pool, batch_id, table_name, vins, days):
+    """Fetch one chunk (table + VIN list). On SerializationFailure, retry each VIN individually and skip only the one(s) that error."""
     if not vins:
         return pd.DataFrame()
-    conn = connect()
-    if not conn:
-        return pd.DataFrame()
+    conn = pool.getconn()
     try:
         return fetch_iot_data(conn, batch_id, table_name, vins, days)
     except (psycopg2.errors.SerializationFailure, pd.errors.DatabaseError) as e:
         if not _is_serialization_failure(e):
             raise
-        log(f"fetch_iot_data batch_id={batch_id} table={table_name} ({len(vins)} VINs) conflict with recovery, skipping chunk.")
-        return pd.DataFrame()
+        log(f"fetch_iot_data batch_id={batch_id} table={table_name} ({len(vins)} VINs) conflict with recovery, retrying VIN-by-VIN.")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        dfs = []
+        skipped = 0
+        for i, vin in enumerate(vins, 1):
+            try:
+                df_one = fetch_iot_data(conn, batch_id, table_name, [vin], days, quiet=True)
+                if df_one is not None and not df_one.empty:
+                    dfs.append(df_one)
+                    log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] {vin} ok ({len(df_one)} rows)")
+                else:
+                    log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] {vin} empty")
+            except (psycopg2.errors.SerializationFailure, pd.errors.DatabaseError) as e2:
+                if _is_serialization_failure(e2):
+                    skipped += 1
+                    log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] skipping VIN {vin} (conflict).")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        pool.putconn(conn, close=True)
+                    except Exception:
+                        pass
+                    conn = pool.getconn()
+                else:
+                    raise
+            finally:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+        log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN done: {len(dfs)} fetched, {skipped} skipped")
+        if not dfs:
+            return pd.DataFrame()
+        return pd.concat(dfs, ignore_index=True)
     finally:
-        conn.close()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        pool.putconn(conn)
 
 
 def pick_and_sanitize(df, cols, rule):
@@ -934,41 +976,48 @@ def main():
     global days
     main_start = time.time()
     log("START main")
-    log(f"N_WORKERS={N_WORKERS}")
+    log(f"N_WORKERS={N_WORKERS} MAX_FETCH_THREADS={MAX_FETCH_THREADS}")
     vins = open('vins.txt').read().splitlines()
     log(f"Loaded {len(vins)} VINs from vins.txt")
     days = input("Enter number of days: ")
 
     t0 = time.time()
-    conn = connect()
-    log("DB connect", time.time() - t0)
-    if not conn:
-        log("DB connection failed.")
-        log("Total time", time.time() - main_start)
-        return
-
-    t0 = time.time()
     df_map = map_vins_to_tables(vins)
     table_groups = df_map.groupby("table_name")["VIN"]
-    # One task per (batch_id, table, VIN chunk) so multiple threads fetch the same table in parallel. batch_id tracks each chunk in logs.
+    # Build one task per (table, VIN chunk). Total concurrency for fetch is capped by MAX_FETCH_THREADS.
     tasks = []
     batch_id = 0
     for table_name, vin_series in table_groups:
         vlist = vin_series.to_list()
-        n_chunks = min(FETCH_THREADS_PER_TABLE, max(1, len(vlist)))
+        n_chunks = min(MAX_FETCH_THREADS, max(1, len(vlist)))
         for vin_chunk in np.array_split(vlist, n_chunks):
             if len(vin_chunk) > 0:
                 batch_id += 1
                 tasks.append((batch_id, table_name, list(vin_chunk)))
+    try:
+        pool = ThreadedConnectionPool(
+            minconn=1,
+            maxconn=MAX_FETCH_THREADS,
+            host=os.getenv('DB_HOST'),
+            database=os.getenv('DB_NAME'),
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+        )
+    except Exception as e:
+        log(f"DB connection pool failed: {e}")
+        log("Total time", time.time() - main_start)
+        return
+    log("DB connection pool created", time.time() - t0)
+
     dfs = []
-    max_fetch_workers = min(32, max(N_WORKERS, len(tasks)))
-    with ThreadPoolExecutor(max_workers=max_fetch_workers) as ex:
-        futures = {ex.submit(_fetch_one_table, bid, tbl, vlist, days): bid for bid, tbl, vlist in tasks}
+    t0_fetch = time.time()
+    with ThreadPoolExecutor(max_workers=MAX_FETCH_THREADS) as ex:
+        futures = {ex.submit(_fetch_one_table, pool, bid, tbl, vlist, days): bid for bid, tbl, vlist in tasks}
         for fut in as_completed(futures):
             df_part = fut.result()
             if df_part is not None and not df_part.empty:
                 dfs.append(df_part)
-    log("fetch_iot_data (all tables, chunks per table in parallel)", time.time() - t0)
+    log("fetch_iot_data (all tables, chunks per table in parallel)", time.time() - t0_fetch)
 
     if dfs:
         df_final = pd.concat(dfs, ignore_index=True)
@@ -977,12 +1026,12 @@ def main():
 
     if df_final.empty:
         log("No IoT data retrieved. Exiting.")
-        conn.close()
+        pool.closeall()
         log("Total time", time.time() - main_start)
         return
 
-    conn.close()
-    log("DB connection closed (fetch done).")
+    pool.closeall()
+    log("DB connection pool closed (fetch done).")
     log_df_size("df_final (raw IoT)", df_final)
 
     t0 = time.time()
