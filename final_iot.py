@@ -6,8 +6,12 @@ from datetime import datetime
 import time
 import os
 import warnings
+import threading
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+
+SKIPPED_VINS_FILE = "skipped_vins.txt"
+_skipped_vins_lock = threading.Lock()
 
 from dotenv import load_dotenv
 
@@ -26,6 +30,16 @@ def log(msg, elapsed=None):
         print(f"[{ts}] {msg} (took {elapsed:.2f}s)")
     else:
         print(f"[{ts}] {msg}")
+
+
+def append_skipped_vin(vin):
+    """Append a skipped VIN to skipped_vins.txt (thread-safe)."""
+    with _skipped_vins_lock:
+        try:
+            with open(SKIPPED_VINS_FILE, "a") as f:
+                f.write(vin + "\n")
+        except Exception as e:
+            log(f"Failed to append skipped VIN to {SKIPPED_VINS_FILE}: {e}")
 
 
 def log_df_size(name, df):
@@ -178,6 +192,7 @@ def _fetch_one_table(pool, batch_id, table_name, vins, days):
                 is_retryable = _is_serialization_failure(e2) or isinstance(e2, psycopg2.InterfaceError)
                 if is_retryable:
                     skipped += 1
+                    append_skipped_vin(vin)
                     reason = "conflict" if _is_serialization_failure(e2) else "connection closed"
                     log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] skipping VIN {vin} ({reason}).")
                     try:
