@@ -159,6 +159,11 @@ def _fetch_one_table(pool, batch_id, table_name, vins, days):
             conn.rollback()
         except Exception:
             pass
+        try:
+            pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        conn = pool.getconn()
         dfs = []
         skipped = 0
         for i, vin in enumerate(vins, 1):
@@ -169,10 +174,12 @@ def _fetch_one_table(pool, batch_id, table_name, vins, days):
                     log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] {vin} ok ({len(df_one)} rows)")
                 else:
                     log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] {vin} empty")
-            except (psycopg2.errors.SerializationFailure, pd.errors.DatabaseError) as e2:
-                if _is_serialization_failure(e2):
+            except (psycopg2.errors.SerializationFailure, pd.errors.DatabaseError, psycopg2.InterfaceError) as e2:
+                is_retryable = _is_serialization_failure(e2) or isinstance(e2, psycopg2.InterfaceError)
+                if is_retryable:
                     skipped += 1
-                    log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] skipping VIN {vin} (conflict).")
+                    reason = "conflict" if _is_serialization_failure(e2) else "connection closed"
+                    log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] skipping VIN {vin} ({reason}).")
                     try:
                         conn.rollback()
                     except Exception:
