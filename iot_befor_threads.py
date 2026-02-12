@@ -314,21 +314,25 @@ def charging_start_soc(subdf):
 
 def charging_end_soc(subdf):
     df = subdf.copy()
-    df["soc_diff"] = pd.to_numeric(df["SOC"], errors="coerce").diff()
-    charging = False
-    end_socs = []
+    soc_values = pd.to_numeric(df["SOC"], errors="coerce")
+    soc_difference = soc_values.diff()
+    is_charging = False
+    charging_end_soc_values = []
+    for row_index in range(len(soc_difference)):
+        current_soc_change = soc_difference.iloc[row_index]
 
-    for idx, diff in enumerate(df["soc_diff"]):
-        if diff > 0 and not charging:
-            charging = True
-        elif diff < 0 and charging:
-            # We consider the previous SOC as the end of charging
-            end_soc = df["SOC"].iloc[idx - 1] if idx > 0 else None
-            if end_soc is not None:
-                end_socs.append(end_soc)
-            charging = False
+        if current_soc_change >= 1:
+            is_charging = True
+        elif current_soc_change == 0:
+            pass
+        elif current_soc_change <= -1:
+            if is_charging:
+                last_charged_soc = soc_values.iloc[row_index - 1] if row_index > 0 else None
+                if last_charged_soc is not None:
+                    charging_end_soc_values.append(last_charged_soc)
+            is_charging = False
 
-    return pd.Series(end_socs, name="SOC")
+    return pd.Series(charging_end_soc_values, name="SOC")
 
 def charging_cycle_count(subdf):
     df = subdf.copy()
@@ -511,8 +515,15 @@ def compute_features(df_std, days):
             (subdf["ACCELERATION"] < SANITIZATION_RULES["ACCELERATION"]["min"]) |
             (subdf["ACCELERATION"] > SANITIZATION_RULES["ACCELERATION"]["max"])
         )
-        subdf["CHARGING_START_SOC"] = charging_start_soc(subdf)
-        subdf["CHARGING_END_SOC"] = charging_end_soc(subdf)
+        start_soc = charging_start_soc(subdf)
+        end_soc = charging_end_soc(subdf)
+        n_start, n_end = len(start_soc), len(end_soc)
+        subdf["CHARGING_START_SOC"] = float("nan")
+        subdf["CHARGING_END_SOC"] = float("nan")
+        if n_start:
+            subdf.iloc[:n_start, subdf.columns.get_loc("CHARGING_START_SOC")] = start_soc.values
+        if n_end:
+            subdf.iloc[:n_end, subdf.columns.get_loc("CHARGING_END_SOC")] = end_soc.values
         charging_mask = detect_charging_state(subdf)
         running_mask = subdf["VEHICLE_SPEED"] > 1
         subdf["BATTERY_TEMP_DURING_CHARGE"] = subdf.loc[charging_mask, "BATTERY_TEMPERATURE"]
