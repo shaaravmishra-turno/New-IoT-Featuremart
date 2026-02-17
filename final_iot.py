@@ -1,3 +1,4 @@
+import sys
 import psycopg2
 import psycopg2.errors
 from psycopg2.pool import ThreadedConnectionPool
@@ -1011,7 +1012,11 @@ def main():
     log(f"N_WORKERS={N_WORKERS} MAX_FETCH_THREADS={MAX_FETCH_THREADS}")
     vins = open('vins.txt').read().splitlines()
     log(f"Loaded {len(vins)} VINs from vins.txt")
-    days = input("Enter number of days: ")
+    days_input = input("Enter number of days: ")
+    days = int(days_input)
+    if days is None or days <= 0:
+        log("Invalid days; must be a positive integer. Exiting.")
+        return
 
     t0 = time.time()
     df_map = map_vins_to_tables(vins)
