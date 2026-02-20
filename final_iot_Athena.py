@@ -1,7 +1,4 @@
 import sys
-import psycopg2
-import psycopg2.errors
-from psycopg2.pool import ThreadedConnectionPool
 import pandas as pd
 from datetime import datetime, timedelta
 import time
@@ -19,8 +16,8 @@ from dotenv import load_dotenv
 load_dotenv()
 warnings.filterwarnings("ignore")
 
-# Athena: used for mahindra_vehicle_data when ATHENA_S3_STAGING is set.
-# Optional .env: ATHENA_S3_STAGING (required for Athena), ATHENA_REGION, ATHENA_DATABASE, ATHENA_MAHINDRA_TABLE
+# This script is Athena-only: fetches Mahindra vehicle data from Athena (no Timescale/Postgres).
+# .env: ATHENA_S3_STAGING (required), ATHENA_REGION, ATHENA_DATABASE, ATHENA_MAHINDRA_TABLE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 try:
     from pyathena import connect as athena_connect  # type: ignore[import-untyped]
     _ATHENA_AVAILABLE = True
@@ -34,11 +31,11 @@ ATHENA_DATABASE = os.getenv("ATHENA_DATABASE", "default")
 # Parallel workers: fetch (threads), compute_features (processes). Optimal = CPU count.
 N_WORKERS = os.cpu_count() or 4
 
-# Total max threads used for fetching (shared across all tables). Pool and executor use this limit.
-MAX_FETCH_THREADS = min(32, os.cpu_count() or 4)
+# Max threads for parallel Athena fetch (chunks).
+MAX_FETCH_THREADS = min(32, os.cpu_count())
 
-# Max VINs per fetch chunk (smaller chunks reduce load and conflict-with-recovery errors).
-MAX_VINS_PER_CHUNK = 50
+# Max VINs per fetch chunk (Athena). Override with env MAX_VINS_PER_CHUNK.
+MAX_VINS_PER_CHUNK = int(os.getenv("MAX_VINS_PER_CHUNK", "50"))
 
 def log(msg, elapsed=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -84,17 +81,6 @@ std_columns = [
             'ACCELERATION'
         ]
 
-def connect():
-    try:
-        return psycopg2.connect(
-            host=os.getenv('DB_HOST'),
-            database=os.getenv('DB_NAME'),
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD')
-        )
-    except Exception as e:
-        print("DB error:", e)
-
 VIN_TABLE_MAP = {
     "MBX": "piaggio_vehicle_data",
     "MA":  "mahindra_vehicle_data",
@@ -127,13 +113,6 @@ def table_from_vin_series(vin_series):
     out = v.str[:3].map(VIN_TABLE_MAP)
     return out.fillna(v.str[:2].map(VIN_TABLE_MAP))
 
-
-TS_COLUMN_MAP = {
-    'piaggio_vehicle_data': 'gps_data_timestamp',
-    'mahindra_vehicle_data': 'last_connected',
-    'euler_vehicle_data': 'location_data_last_updated_at',
-    'montra_location_data': 'event_at'
-}
 
 # Athena mahindra_vehicles: only columns that feed standardize() -> compute_features().
 # (EVENT_AT, SOC, BATTERY_TEMPERATURE, POWER_DRAWN_KWH, ODOMETER, LAT/LONG, DISTANCE_TO_EMPTY, LICENSE_PLATE, MODEL, VARIANT, COLOR, GEAR_POSITION, STATE)
@@ -222,28 +201,25 @@ def _athena_partition_filter_for_last_n_days(days):
     return f"AND (year, month, day) IN (VALUES {values_sql})"
 
 
-def fetch_mahindra_from_athena(batch_id, vins, days, quiet=False):
+def _fetch_mahindra_athena_one_chunk(vins_chunk, days, chunk_id=None):
     """
-    Fetch Mahindra data from Athena table mahindra_vehicles.
-    Uses year, month, day partition columns to limit scan to last `days` days.
-    Returns DataFrame with columns converted to Timescale-style names and types.
+    Run one Athena query for a single chunk of VINs (up to MAX_VINS_PER_CHUNK).
+    Returns converted DataFrame without table_name/OEM (caller adds).
+    When chunk_id is set, logs start/end with thread name to show parallel execution.
     """
-    if not _athena_configured() or not vins:
+    if not vins_chunk:
         return pd.DataFrame()
-    if not quiet:
-        t0 = time.time()
-        log(f"fetch_mahindra_from_athena batch_id={batch_id} START ({len(vins)} VINs)")
+    thread_name = threading.current_thread().name
+    label = f"chunk_{chunk_id}" if chunk_id is not None else "chunk"
+    t0 = time.time()
+    log(f"[{thread_name}] Athena {label} START ({len(vins_chunk)} VINs)")
     s3_staging = os.getenv("ATHENA_S3_STAGING")
     region = os.getenv("ATHENA_REGION", "ap-south-1")
     aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
     aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-    # lastconnected in Athena is bigint (Unix milliseconds). Cutoff for "last N days"
-    cutoff_ts = (datetime.utcnow() - timedelta(days=int(days))).timestamp() * 1000
-    cutoff_ts = int(cutoff_ts)
-    # Safe IN clause: escape single quotes in VINs
-    vin_list_sql = ",".join("'" + str(v).replace("'", "''") + "'" for v in vins)
+    cutoff_ts = int((datetime.utcnow() - timedelta(days=int(days))).timestamp() * 1000)
+    vin_list_sql = ",".join("'" + str(v).replace("'", "''") + "'" for v in vins_chunk)
     cols = ", ".join(ATHENA_MAHINDRA_COLUMNS)
-    # Quote identifiers so names with hyphens (e.g. oem-iot-data) are valid in Athena
     def quote_id(name):
         return '"' + str(name).replace('"', '""') + '"'
     from_clause = f"{quote_id(ATHENA_DATABASE)}.{quote_id(ATHENA_MAHINDRA_TABLE)}"
@@ -256,10 +232,7 @@ def fetch_mahindra_from_athena(batch_id, vins, days, quiet=False):
         {partition_filter}
     """
     try:
-        connect_kw = {
-            "s3_staging_dir": s3_staging,
-            "region_name": region,
-        }
+        connect_kw = {"s3_staging_dir": s3_staging, "region_name": region}
         if aws_access_key and aws_secret_key:
             connect_kw["aws_access_key_id"] = aws_access_key
             connect_kw["aws_secret_access_key"] = aws_secret_key
@@ -269,122 +242,79 @@ def fetch_mahindra_from_athena(batch_id, vins, days, quiet=False):
             df_athena = pd.read_sql(sql, conn)
         conn.close()
     except Exception as e:
-        log(f"fetch_mahindra_from_athena batch_id={batch_id} failed: {e}")
+        log(f"[{thread_name}] Athena {label} FAILED ({len(vins_chunk)} VINs): {e}")
         return pd.DataFrame()
     df = convert_athena_mahindra_to_timescale_format(df_athena)
+    n_rows = len(df) if df is not None else 0
+    log(f"[{thread_name}] Athena {label} END ({n_rows} rows, took {time.time() - t0:.2f}s)")
+    return df
+
+
+def fetch_mahindra_from_athena(batch_id, vins, days, quiet=False):
+    """
+    Fetch Mahindra data from Athena in parallel by splitting VINs into chunks of MAX_VINS_PER_CHUNK.
+    Uses year, month, day partition columns to limit scan to last `days` days.
+    Returns DataFrame with columns converted to Timescale-style names and types.
+    """
+    if not _athena_configured() or not vins:
+        return pd.DataFrame()
+    if not quiet:
+        t0 = time.time()
+        log(f"fetch_mahindra_from_athena batch_id={batch_id} START ({len(vins)} VINs)")
+    # Split into chunks of MAX_VINS_PER_CHUNK for parallel Athena queries
+    n_chunks = max(1, (len(vins) + MAX_VINS_PER_CHUNK - 1) // MAX_VINS_PER_CHUNK)
+    chunks = [list(c) for c in np.array_split(vins, n_chunks) if len(c) > 0]
+    max_workers = min(len(chunks), MAX_FETCH_THREADS)
+    if not quiet:
+        log(f"fetch_mahindra_from_athena: {len(chunks)} chunks, max_workers={max_workers} (parallel)")
+    if len(chunks) == 1:
+        try:
+            df = _fetch_mahindra_athena_one_chunk(chunks[0], days, chunk_id=1)
+            dfs = [df] if (df is not None and not df.empty) else []
+        except Exception:
+            dfs = []
+        if not dfs and chunks[0]:
+            for vin in chunks[0]:
+                append_skipped_vin(vin)
+    else:
+        dfs = []
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(_fetch_mahindra_athena_one_chunk, ch, days, idx + 1): ch
+                for idx, ch in enumerate(chunks)
+            }
+            for fut in as_completed(futures):
+                chunk_vins = futures[fut]
+                try:
+                    part = fut.result()
+                    if part is not None and not part.empty:
+                        dfs.append(part)
+                    else:
+                        for vin in chunk_vins:
+                            append_skipped_vin(vin)
+                except Exception:
+                    for vin in chunk_vins:
+                        append_skipped_vin(vin)
+    if not dfs:
+        if not quiet:
+            log(f"fetch_mahindra_from_athena batch_id={batch_id} END (no data)", time.time() - t0)
+        return pd.DataFrame()
+    df = pd.concat(dfs, ignore_index=True)
     df["table_name"] = "mahindra_vehicle_data"
     df["OEM"] = oem_from_vin_series(df["vin"])
     if not quiet:
-        log(f"fetch_mahindra_from_athena batch_id={batch_id} END", time.time() - t0)
+        log(f"fetch_mahindra_from_athena batch_id={batch_id} END ({len(chunks)} chunks)", time.time() - t0)
         log_df_size(f"fetch_mahindra_from_athena batch_id={batch_id}", df)
     return df
 
 
-def _select_columns_for_table(table_name):
-    """Return comma-separated column list for SELECT; only columns we use in standardize."""
-    mapping = column_mappings.get(table_name, {})
-    return ", ".join(mapping.keys()) if mapping else "*"
-
-
-def fetch_iot_data(conn, batch_id, table_name, vins, days, quiet=False):
-    if not quiet:
-        t0 = time.time()
-        log(f"fetch_iot_data batch_id={batch_id} START table={table_name} ({len(vins)} VINs)")
-    ts_col = TS_COLUMN_MAP.get(table_name, "timestamp")
-    cols = _select_columns_for_table(table_name)
-
-    sql = f"""
-        SELECT {cols}
-        FROM {table_name}
-        WHERE vin = ANY(%s)
-        AND {ts_col} >= NOW() - INTERVAL '{int(days)} days'
-    """
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        df = pd.read_sql(sql, conn, params=(vins,))
-    df["table_name"] = table_name
-    df["OEM"] = oem_from_vin_series(df["vin"])
-    if not quiet:
-        log(f"fetch_iot_data batch_id={batch_id} END table={table_name}", time.time() - t0)
-        log_df_size(f"fetch_iot_data batch_id={batch_id} {table_name}", df)
-    return df
-
-
-def _is_serialization_failure(e):
-    """Check if exception is SerializationFailure (direct or wrapped by pandas)."""
-    if isinstance(e, psycopg2.errors.SerializationFailure):
-        return True
-    cause = getattr(e, "__cause__", None)
-    return cause is not None and isinstance(cause, psycopg2.errors.SerializationFailure)
-
-
-def _fetch_one_table(pool, batch_id, table_name, vins, days):
-    """Fetch one chunk (table + VIN list). On SerializationFailure, retry each VIN individually and skip only the one(s) that error.
-    For mahindra_vehicle_data, when Athena is configured (ATHENA_S3_STAGING), fetches from Athena instead of Timescale."""
+def _fetch_one_table(batch_id, table_name, vins, days):
+    """Fetch one task from Athena. This script is Athena-only (Mahindra data)."""
     if not vins:
         return pd.DataFrame()
-    # Mahindra: fetch from Athena when configured
     if table_name == "mahindra_vehicle_data" and _athena_configured():
         return fetch_mahindra_from_athena(batch_id, vins, days)
-    conn = pool.getconn()
-    try:
-        return fetch_iot_data(conn, batch_id, table_name, vins, days)
-    except (psycopg2.errors.SerializationFailure, pd.errors.DatabaseError) as e:
-        if not _is_serialization_failure(e):
-            raise
-        log(f"fetch_iot_data batch_id={batch_id} table={table_name} ({len(vins)} VINs) conflict with recovery, retrying VIN-by-VIN.")
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        try:
-            pool.putconn(conn, close=True)
-        except Exception:
-            pass
-        conn = pool.getconn()
-        dfs = []
-        skipped = 0
-        for i, vin in enumerate(vins, 1):
-            try:
-                df_one = fetch_iot_data(conn, batch_id, table_name, [vin], days, quiet=True)
-                if df_one is not None and not df_one.empty:
-                    dfs.append(df_one)
-                    log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] {vin} ok ({len(df_one)} rows)")
-                else:
-                    log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] {vin} empty")
-            except (psycopg2.errors.SerializationFailure, pd.errors.DatabaseError, psycopg2.InterfaceError) as e2:
-                is_retryable = _is_serialization_failure(e2) or isinstance(e2, psycopg2.InterfaceError)
-                if is_retryable:
-                    skipped += 1
-                    append_skipped_vin(vin)
-                    reason = "conflict" if _is_serialization_failure(e2) else "connection closed"
-                    log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN [{i}/{len(vins)}] skipping VIN {vin} ({reason}).")
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    try:
-                        pool.putconn(conn, close=True)
-                    except Exception:
-                        pass
-                    conn = pool.getconn()
-                else:
-                    raise
-            finally:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-        log(f"fetch_iot_data batch_id={batch_id} table={table_name} VIN-by-VIN done: {len(dfs)} fetched, {skipped} skipped")
-        if not dfs:
-            return pd.DataFrame()
-        return pd.concat(dfs, ignore_index=True)
-    finally:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        pool.putconn(conn)
+    return pd.DataFrame()
 
 
 def pick_and_sanitize(df, cols, rule):
@@ -1171,70 +1101,79 @@ def standardize(df_final):
     return df_std
 
 
-def main():
-    global days
-    main_start = time.time()
-    log("START main")
-    log(f"N_WORKERS={N_WORKERS} MAX_FETCH_THREADS={MAX_FETCH_THREADS}")
-    vins = open('vins.txt').read().splitlines()
-    log(f"Loaded {len(vins)} VINs from vins.txt")
-    days_input = input("Enter number of days: ")
-    days = int(days_input)
-    if days is None or days <= 0:
-        log("Invalid days; must be a positive integer. Exiting.")
-        return
-
-    t0 = time.time()
+def _build_fetch_tasks(vins):
+    """Build list of (batch_id, table_name, vlist). Athena Mahindra: one task (chunked inside fetch); others: chunk by MAX_VINS_PER_CHUNK."""
     df_map = map_vins_to_tables(vins)
     table_groups = df_map.groupby("table_name")["VIN"]
-    # Build one task per (table, VIN chunk). Chunk size capped at MAX_VINS_PER_CHUNK; concurrency capped by MAX_FETCH_THREADS.
     tasks = []
     batch_id = 0
     for table_name, vin_series in table_groups:
         vlist = vin_series.to_list()
-        n_chunks = max(1, (len(vlist) + MAX_VINS_PER_CHUNK - 1) // MAX_VINS_PER_CHUNK)
-        for vin_chunk in np.array_split(vlist, n_chunks):
-            if len(vin_chunk) > 0:
-                batch_id += 1
-                tasks.append((batch_id, table_name, list(vin_chunk)))
-    try:
-        pool = ThreadedConnectionPool(
-            minconn=1,
-            maxconn=MAX_FETCH_THREADS,
-            host=os.getenv('DB_HOST'),
-            database=os.getenv('DB_NAME'),
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD'),
-        )
-    except Exception as e:
-        log(f"DB connection pool failed: {e}")
-        log("Total time", time.time() - main_start)
-        return
-    log("DB connection pool created", time.time() - t0)
+        if table_name == "mahindra_vehicle_data" and _athena_configured():
+            batch_id += 1
+            tasks.append((batch_id, table_name, vlist))
+        else:
+            n_chunks = max(1, (len(vlist) + MAX_VINS_PER_CHUNK - 1) // MAX_VINS_PER_CHUNK)
+            for vin_chunk in np.array_split(vlist, n_chunks):
+                if len(vin_chunk) > 0:
+                    batch_id += 1
+                    tasks.append((batch_id, table_name, list(vin_chunk)))
+    return tasks
 
+
+def run_parallel_fetch(tasks, days):
+    """
+    Run all fetch tasks in parallel via ThreadPoolExecutor (Athena only; no Timescale).
+    Returns concatenated DataFrame (possibly empty).
+    """
+    t0 = time.time()
+    log("Fetch: starting parallel tasks (Athena).")
     dfs = []
-    t0_fetch = time.time()
     with ThreadPoolExecutor(max_workers=MAX_FETCH_THREADS) as ex:
-        futures = {ex.submit(_fetch_one_table, pool, bid, tbl, vlist, days): bid for bid, tbl, vlist in tasks}
+        futures = {ex.submit(_fetch_one_table, bid, tbl, vlist, days): bid for bid, tbl, vlist in tasks}
         for fut in as_completed(futures):
             df_part = fut.result()
             if df_part is not None and not df_part.empty:
                 dfs.append(df_part)
-    log("fetch_iot_data (all tables, chunks per table in parallel)", time.time() - t0_fetch)
+    log("Fetch: all tasks done", time.time() - t0)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-    if dfs:
-        df_final = pd.concat(dfs, ignore_index=True)
+
+def main():
+    global days
+    main_start = time.time()
+    log("START main")
+    log(f"N_WORKERS={N_WORKERS} MAX_FETCH_THREADS={MAX_FETCH_THREADS} MAX_VINS_PER_CHUNK={MAX_VINS_PER_CHUNK}")
+
+    # days: from argv (e.g. batch_hit) or interactive input
+    if len(sys.argv) >= 2:
+        try:
+            days = int(sys.argv[1])
+        except ValueError:
+            log("Invalid days argument; must be a positive integer. Exiting.")
+            return
     else:
-        df_final = pd.DataFrame()
+        try:
+            days_input = input("Enter number of days: ")
+            days = int(days_input)
+        except (ValueError, EOFError):
+            log("Invalid days; must be a positive integer. Exiting.")
+            return
+    if days is None or days <= 0:
+        log("Invalid days; must be a positive integer. Exiting.")
+        return
 
+    vins = open("vins.txt").read().splitlines()
+    log(f"Loaded {len(vins)} VINs from vins.txt")
+    log(f"Days: {days}")
+
+    tasks = _build_fetch_tasks(vins)
+    df_final = run_parallel_fetch(tasks, days)
     if df_final.empty:
         log("No IoT data retrieved. Exiting.")
-        pool.closeall()
         log("Total time", time.time() - main_start)
         return
 
-    pool.closeall()
-    log("DB connection pool closed (fetch done).")
     log_df_size("df_final (raw IoT)", df_final)
 
     t0 = time.time()
@@ -1265,8 +1204,12 @@ def main():
     log_df_size("df_long", df_long)
 
     t0 = time.time()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"computed_features_{timestamp}.csv"
+    # output file: from argv[2] (e.g. batch_hit) or default timestamped name
+    if len(sys.argv) >= 3:
+        output_file = sys.argv[2]
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"computed_features_{timestamp}.csv"
     df_long.to_csv(output_file, index=False)
     log(f"to_csv -> {output_file}", time.time() - t0)
 
