@@ -9,7 +9,11 @@ import os
 import warnings
 import threading
 import numpy as np
+from math import radians, sin, cos, sqrt, atan2
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from sklearn.cluster import DBSCAN
+
+APPLICANT_EXCEL = os.path.join(os.path.dirname(__file__), "utils", "Clustering Analysis - Base Table.xlsx")
 
 SKIPPED_VINS_FILE = "skipped_vins.txt"
 _skipped_vins_lock = threading.Lock()
@@ -682,6 +686,90 @@ def convert_to_long(df_features):
     return df_long
 
 
+def haversine_meters(lat1, lon1, lat2, lon2):
+    """Haversine distance in meters between two (lat, lon) points."""
+    R = 6371000
+    la1, lo1, la2, lo2 = radians(lat1), radians(lon1), radians(lat2), radians(lon2)
+    dlat, dlon = la2 - la1, lo2 - lo1
+    a = sin(dlat / 2) ** 2 + cos(la1) * cos(la2) * sin(dlon / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+def compute_triggers(df_std, df_features, days):
+    """Generate trigger rows: VIN, OEM, Feature_Name, Feature_Value.
+
+    Triggers:
+      1. FAR_FROM_NIGHT_LOCATION_L{days}  – distance (m) between night parking
+         cluster centroid and applicant address from the Excel file.
+      2. LOW_DISTANCE_TRAVELLED_L{days}    – 1 if total distance < 1 km * days,
+         else 0.
+    """
+    try:
+        df_app = pd.read_excel(APPLICANT_EXCEL, usecols=["vin", "applicant_address.latitude", "applicant_address.longitude"])
+        df_app = df_app.rename(columns={"vin": "VIN", "applicant_address.latitude": "APP_LAT", "applicant_address.longitude": "APP_LON"})
+        df_app = df_app.dropna(subset=["APP_LAT", "APP_LON"])
+        app_lookup = df_app.set_index("VIN")[["APP_LAT", "APP_LON"]].to_dict("index")
+    except Exception as e:
+        log(f"Could not load applicant Excel: {e}")
+        app_lookup = {}
+
+    night_col = f"NIGHT_LOCATION_L{days}"
+    dist_col = f"DISTANCE_TRAVELLED_L{days}"
+    min_distance = 1.0 * days
+
+    rows = []
+    for _, r in df_features.iterrows():
+        vin, oem = r["VIN"], r.get("OEM")
+
+        # --- Trigger 1: FAR_FROM_NIGHT_LOCATION ---
+        night_val = r.get(night_col)
+        if night_val and vin in app_lookup:
+            try:
+                nlat, nlon = map(float, str(night_val).split(","))
+                app = app_lookup[vin]
+                dist_m = round(haversine_meters(nlat, nlon, app["APP_LAT"], app["APP_LON"]), 2)
+                rows.append({"VIN": vin, "OEM": oem, "Feature_Name": f"FAR_FROM_NIGHT_LOCATION_L{days}", "Feature_Value": dist_m})
+            except Exception:
+                pass
+
+        # --- Trigger 2: LOW_DISTANCE_TRAVELLED ---
+        dist_val = r.get(dist_col)
+        if dist_val is not None:
+            try:
+                triggered = 1 if float(dist_val) < min_distance else 0
+                rows.append({"VIN": vin, "OEM": oem, "Feature_Name": f"LOW_DISTANCE_TRAVELLED_L{days}", "Feature_Value": triggered})
+            except Exception:
+                pass
+
+    return pd.DataFrame(rows, columns=["VIN", "OEM", "Feature_Name", "Feature_Value"])
+
+
+def night_location(subdf):
+    """Return the dominant night (0-6 AM) parking location as 'lat, lon' using DBSCAN (100m) + haversine."""
+    lat = pd.to_numeric(subdf["LATITUDE"], errors="coerce")
+    lon = pd.to_numeric(subdf["LONGITUDE"], errors="coerce")
+    hour = subdf["EVENT_AT"].dt.hour
+
+    mask = (
+        lat.notna() & lon.notna() &
+        lat.between(8.0, 37.0) & lon.between(68.0, 98.0) &
+        hour.between(0, 6)
+    )
+
+    lat_valid, lon_valid = lat[mask].values, lon[mask].values
+    if len(lat_valid) < 1:
+        return None
+
+    coords_rad = np.radians(np.column_stack([lat_valid, lon_valid]))
+    labels = DBSCAN(
+        eps=100 / 6371000, min_samples=1, metric='haversine', algorithm='ball_tree'
+    ).fit_predict(coords_rad)
+
+    dominant = max(set(labels) - {-1}, key=lambda c: (labels == c).sum())
+    m = labels == dominant
+    return f"{lat_valid[m].mean():.5f}, {lon_valid[m].mean():.5f}"
+
+
 FEATURES = {
     "BATTERY_REMAINING_CAPACITY": {
         "col": "REMAINING_CAPACITY",
@@ -761,6 +849,7 @@ COMPLEX_FEATURES = {
     "LATEST_ODOMETER": lambda df: df["ODOMETER"].iloc[-1] if len(df) > 0 else None,
     "BATTERY_POWER_KWH_PER_KM": lambda df: power_per_km(df),
     "BATTERY_POWER_KWH_PER_HR": lambda df: power_per_hour(df),
+    "NIGHT_LOCATION": lambda df: night_location(df),
 }
 
 
@@ -1106,6 +1195,15 @@ def main():
     output_file = f"computed_features_{timestamp}.csv"
     df_long.to_csv(output_file, index=False)
     log(f"to_csv -> {output_file}", time.time() - t0)
+
+    t0 = time.time()
+    df_triggers = compute_triggers(df_std, df_features, days)
+    if not df_triggers.empty:
+        triggers_file = f"triggers_{timestamp}.csv"
+        df_triggers.to_csv(triggers_file, index=False)
+        log(f"triggers -> {triggers_file} ({len(df_triggers)} rows)", time.time() - t0)
+    else:
+        log("No triggers generated.", time.time() - t0)
 
     log("Total time", time.time() - main_start)
     log("END main")
