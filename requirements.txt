@@ -1,5 +1,7 @@
 dotenv
 psycopg2-binary
 pandas
-scikit-learn
 openpyxl
+matplotlib
+seaborn
+scorecardpy
