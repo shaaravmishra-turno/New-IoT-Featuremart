@@ -605,7 +605,7 @@ def compute_triggers(df_features, days):
                 nlat, nlon = map(float, str(night_val).split(","))
                 app = app_lookup[vin]
                 dist_m = round(haversine_meters(nlat, nlon, app["APP_LAT"], app["APP_LON"]), 2)
-                if dist_m > 200:
+                if dist_m > 60000:
                     rows.append({"VIN": vin, "OEM": oem, "Feature_Name": f"FAR_FROM_NIGHT_LOCATION_L{days}", "Feature_Value": dist_m})
             except Exception:
                 pass
