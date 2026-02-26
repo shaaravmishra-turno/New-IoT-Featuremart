@@ -696,18 +696,12 @@ def haversine_meters(lat1, lon1, lat2, lon2):
 
 
 def compute_triggers(df_std, df_features, days):
-    """Generate trigger rows: VIN, OEM, Feature_Name, Feature_Value.
 
-    Triggers:
-      1. FAR_FROM_NIGHT_LOCATION_L{days}  – distance (m) between night parking
-         cluster centroid and applicant address from the Excel file.
-      2. LOW_DISTANCE_TRAVELLED_L{days}    – 1 if total distance < 1 km * days,
-         else 0.
-    """
     try:
         df_app = pd.read_excel(APPLICANT_EXCEL, usecols=["vin", "applicant_address.latitude", "applicant_address.longitude"])
         df_app = df_app.rename(columns={"vin": "VIN", "applicant_address.latitude": "APP_LAT", "applicant_address.longitude": "APP_LON"})
         df_app = df_app.dropna(subset=["APP_LAT", "APP_LON"])
+        df_app = df_app.drop_duplicates(subset=["VIN"], keep="first")
         app_lookup = df_app.set_index("VIN")[["APP_LAT", "APP_LON"]].to_dict("index")
     except Exception as e:
         log(f"Could not load applicant Excel: {e}")
@@ -720,24 +714,23 @@ def compute_triggers(df_std, df_features, days):
     rows = []
     for _, r in df_features.iterrows():
         vin, oem = r["VIN"], r.get("OEM")
-
-        # --- Trigger 1: FAR_FROM_NIGHT_LOCATION ---
         night_val = r.get(night_col)
         if night_val and vin in app_lookup:
             try:
                 nlat, nlon = map(float, str(night_val).split(","))
                 app = app_lookup[vin]
                 dist_m = round(haversine_meters(nlat, nlon, app["APP_LAT"], app["APP_LON"]), 2)
-                rows.append({"VIN": vin, "OEM": oem, "Feature_Name": f"FAR_FROM_NIGHT_LOCATION_L{days}", "Feature_Value": dist_m})
+                if dist_m > 200:
+                    rows.append({"VIN": vin, "OEM": oem, "Feature_Name": f"FAR_FROM_NIGHT_LOCATION_L{days}", "Feature_Value": dist_m})
             except Exception:
                 pass
 
-        # --- Trigger 2: LOW_DISTANCE_TRAVELLED ---
         dist_val = r.get(dist_col)
         if dist_val is not None:
             try:
-                triggered = 1 if float(dist_val) < min_distance else 0
-                rows.append({"VIN": vin, "OEM": oem, "Feature_Name": f"LOW_DISTANCE_TRAVELLED_L{days}", "Feature_Value": triggered})
+                dist_km = round(float(dist_val), 2)
+                if dist_km < min_distance:
+                    rows.append({"VIN": vin, "OEM": oem, "Feature_Name": f"LOW_DISTANCE_TRAVELLED_L{days}", "Feature_Value": dist_km})
             except Exception:
                 pass
 
